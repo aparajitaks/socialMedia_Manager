@@ -9,6 +9,7 @@ import {
   retryPost,
   approvePost,
 } from '@/lib/api';
+import PlatformLogo from './PlatformLogo';
 
 type FilterStatus = Post['status'] | 'all';
 
@@ -184,8 +185,8 @@ export default function StatusView({ posts, accounts, role, onPostUpdated, onSel
 
                     {/* Platform */}
                     <td className="px-4 py-3 whitespace-nowrap">
-                      <span className="flex items-center gap-1.5 text-xs" style={{ color: '#1C2321' }}>
-                        <span className="w-2 h-2 rounded-full shrink-0" style={{ background: color }} />
+                      <span className="flex items-center gap-2 text-xs" style={{ color: '#1C2321' }}>
+                        <PlatformLogo platform={post.platform} size={16} />
                         {PLATFORM_LABELS[post.platform]}
                       </span>
                     </td>

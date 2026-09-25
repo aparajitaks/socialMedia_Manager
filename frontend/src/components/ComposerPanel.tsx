@@ -8,6 +8,7 @@ import {
   Platform,
   createPosts,
 } from '@/lib/api';
+import PlatformLogo from './PlatformLogo';
 
 interface Props {
   accounts: SocialAccount[];
@@ -172,7 +173,7 @@ export default function ComposerPanel({ accounts, initialDate, onClose, onCreate
                         color: active ? '#1C2321' : '#9A9A93',
                       }}
                     >
-                      <span className="w-2 h-2 rounded-full" style={{ background: color }} />
+                      <PlatformLogo platform={acc.platform} size={15} />
                       {acc.display_name}
                     </button>
                   );
@@ -194,10 +195,10 @@ export default function ComposerPanel({ accounts, initialDate, onClose, onCreate
             return (
               <div key={acc.id}>
                 <label
-                  className="flex items-center gap-1.5 text-xs font-medium mb-1.5"
+                  className="flex items-center gap-2 text-xs font-medium mb-1.5"
                   style={{ color: '#1C2321' }}
                 >
-                  <span className="w-2 h-2 rounded-full" style={{ background: PLATFORM_COLORS[acc.platform] }} />
+                  <PlatformLogo platform={acc.platform} size={16} />
                   {PLATFORM_LABELS[acc.platform]} — {acc.display_name}
                 </label>
                 <textarea

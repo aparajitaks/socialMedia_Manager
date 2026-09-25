@@ -16,6 +16,7 @@ import {
   syncMetrics,
   PostMetric,
 } from '@/lib/api';
+import PlatformLogo from './PlatformLogo';
 
 const RANGES = ['Last 7 days', 'Last 30 days', 'This month'] as const;
 type Range = typeof RANGES[number];
@@ -261,11 +262,8 @@ export default function AnalyticsView({ posts, showToast }: Props) {
                       </p>
                     </td>
                     <td className="px-4 py-3 whitespace-nowrap">
-                      <span className="flex items-center gap-1.5 text-xs" style={{ color: '#1C2321' }}>
-                        <span
-                          className="w-2 h-2 rounded-full"
-                          style={{ background: PLATFORM_COLORS[post.platform] ?? '#9A9A93' }}
-                        />
+                      <span className="flex items-center gap-2 text-xs" style={{ color: '#1C2321' }}>
+                        <PlatformLogo platform={post.platform} size={16} />
                         {PLATFORM_LABELS[post.platform]}
                       </span>
                     </td>

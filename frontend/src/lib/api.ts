@@ -63,6 +63,14 @@ export const PLATFORM_LABELS: Record<Platform, string> = {
   x: 'X (Twitter)',
 };
 
+export const PLATFORM_LOGOS: Record<Platform, string> = {
+  linkedin: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcR5R9I9iV2-YEJQd_L4vObRF5nn98LYGEgYbjKA5lIcsw&s=10',
+  instagram: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQpqR3mTVBIQI098yD0OlH0ojttu71mNrJiMHAz4eoLSw&s=10',
+  facebook: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRbNM9YrPyE_2yGxHIE0mzfdsegYeLAMiSPbsWdqPvJmA&s=10',
+  google_business: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcS8mCfXC2zufaJeFuwCkrlqyMVKK_tL7ggC8diyDCtRQA&s=10',
+  x: '',
+};
+
 // ---- API calls ----
 export async function fetchAccounts(): Promise<SocialAccount[]> {
   const res = await fetch('/api/accounts');

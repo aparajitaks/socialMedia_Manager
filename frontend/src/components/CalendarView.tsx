@@ -8,6 +8,7 @@ import {
   PLATFORM_LABELS,
   Platform,
 } from '@/lib/api';
+import PlatformLogo from './PlatformLogo';
 
 const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 const MONTHS = [
@@ -140,10 +141,7 @@ export default function CalendarView({ posts, accounts, openComposer, onSelectPo
         <div className="flex items-center gap-3">
           {platformsInUse.map((p) => (
             <span key={p} className="flex items-center gap-1.5 text-xs" style={{ color: '#9A9A93' }}>
-              <span
-                className="inline-block w-2 h-2 rounded-sm"
-                style={{ background: PLATFORM_COLORS[p] }}
-              />
+              <PlatformLogo platform={p} size={14} />
               {PLATFORM_LABELS[p]}
             </span>
           ))}
@@ -227,7 +225,7 @@ export default function CalendarView({ posts, accounts, openComposer, onSelectPo
                           style={{ background: color + '18' }}
                           onClick={(e) => { e.stopPropagation(); onSelectPost(post); }}
                         >
-                          <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: color }} />
+                          <PlatformLogo platform={post.platform} size={12} />
                           <span className="text-xs truncate" style={{ color: '#1C2321', fontSize: 11 }}>
                             {acc?.display_name.split(' ')[0] ?? post.platform}
                           </span>
@@ -258,7 +256,7 @@ export default function CalendarView({ posts, accounts, openComposer, onSelectPo
                             onClick={(e) => { e.stopPropagation(); onSelectPost(post); }}
                           >
                             <div className="flex items-center gap-1.5 mb-1">
-                              <span className="w-2 h-2 rounded-full shrink-0" style={{ background: color }} />
+                              <PlatformLogo platform={post.platform} size={16} />
                               <span className="font-medium" style={{ color: '#1C2321' }}>
                                 {acc?.display_name ?? post.platform}
                               </span>

@@ -12,6 +12,7 @@ import {
   patchPost,
   fetchPostMetrics,
 } from '@/lib/api';
+import PlatformLogo from './PlatformLogo';
 
 interface PostDetailsModalProps {
   post: Post | null;
@@ -141,7 +142,7 @@ export function PostDetailsModal({
           style={{ borderColor: '#D8DAD5' }}
         >
           <div className="flex items-center gap-2">
-            <span className="w-2.5 h-2.5 rounded-full" style={{ background: color }} />
+            <PlatformLogo platform={post.platform} size={18} />
             <span className="text-sm font-semibold" style={{ color: '#1C2321' }}>
               {PLATFORM_LABELS[post.platform]}
             </span>

@@ -9,6 +9,7 @@ import {
   deleteAccount,
   connectAccount,
 } from '@/lib/api';
+import PlatformLogo from './PlatformLogo';
 
 const PLATFORMS: { id: Platform; label: string }[] = [
   { id: 'linkedin', label: 'LinkedIn' },
@@ -145,12 +146,7 @@ export default function AccountsView({ accounts, onRefresh, showToast }: Props) 
                   className="flex items-center gap-3 px-4 py-3"
                   style={{ background: '#FAFAF8', borderBottom: hasAccounts ? '1px solid #D8DAD5' : undefined }}
                 >
-                  <div
-                    className="w-7 h-7 rounded flex items-center justify-center text-white text-xs font-semibold shrink-0"
-                    style={{ background: color }}
-                  >
-                    {label.charAt(0)}
-                  </div>
+                  <PlatformLogo platform={id} size={28} />
                   <div className="flex-1">
                     <div className="text-sm font-medium" style={{ color: '#1C2321' }}>{label}</div>
                     <div className="text-xs" style={{ color: '#9A9A93' }}>
@@ -182,12 +178,17 @@ export default function AccountsView({ accounts, onRefresh, showToast }: Props) 
                       className="flex items-center gap-3 px-4 py-2.5"
                       style={{ borderTop: '1px solid #D8DAD5', background: '#fff' }}
                     >
-                      {/* Avatar */}
-                      <div
-                        className="w-6 h-6 rounded-full flex items-center justify-center text-xs font-medium shrink-0"
-                        style={{ background: color + '20', color: color }}
-                      >
-                        {acc.display_name.charAt(0).toUpperCase()}
+                      {/* Avatar with platform badge */}
+                      <div className="relative shrink-0">
+                        <div
+                          className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-medium"
+                          style={{ background: color + '20', color: color }}
+                        >
+                          {acc.display_name.charAt(0).toUpperCase()}
+                        </div>
+                        <div className="absolute -bottom-1 -right-1">
+                          <PlatformLogo platform={acc.platform} size={14} className="border border-white" />
+                        </div>
                       </div>
                       <div className="flex-1 min-w-0">
                         <div className="text-sm font-medium" style={{ color: '#1C2321' }}>
@@ -255,12 +256,7 @@ export default function AccountsView({ accounts, onRefresh, showToast }: Props) 
               style={{ background: '#FAFAF8', borderColor: '#D8DAD5' }}
             >
               <div className="flex items-center gap-3">
-                <div
-                  className="w-8 h-8 rounded flex items-center justify-center text-white text-sm font-bold"
-                  style={{ background: PLATFORM_COLORS[connectingPlatform] }}
-                >
-                  {PLATFORM_LABELS[connectingPlatform].charAt(0)}
-                </div>
+                <PlatformLogo platform={connectingPlatform} size={32} />
                 <div>
                   <h3 className="text-sm font-semibold" style={{ color: '#1C2321' }}>
                     Connect {PLATFORM_LABELS[connectingPlatform]}
