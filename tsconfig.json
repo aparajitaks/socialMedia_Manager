@@ -1,0 +1,9 @@
+// Root TypeScript project references — each subproject manages its own tsconfig.
+// The IDE uses this file to discover both workspace projects.
+{
+  "files": [],
+  "references": [
+    { "path": "./backend" },
+    { "path": "./frontend" }
+  ]
+}
