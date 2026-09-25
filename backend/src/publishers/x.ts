@@ -4,7 +4,7 @@ import { SocialPublisher, PublishResult, RefreshResult, MetricResult } from './t
 
 export class XPublisher implements SocialPublisher {
   async publish(post: Post, account: SocialAccount): Promise<PublishResult> {
-    const rawToken = decryptToken(account.access_token);
+    const rawToken = decryptToken(account.access_token || account.access_token_encrypted);
 
     if (rawToken === 'invalid_token' || rawToken.startsWith('bad_token')) {
       throw new Error('X API 401: Unauthorized access token');
@@ -31,15 +31,19 @@ export class XPublisher implements SocialPublisher {
         }
 
         const data = await res.json();
-        return { platform_post_id: data.data?.id || `x_${Date.now()}` };
+        const id = data.data?.id || `x_${Date.now()}`;
+        return { success: true, externalPostId: id, platform_post_id: id };
       } catch (err: any) {
         throw new Error(err.message || 'X publish failed');
       }
     }
 
     await new Promise((resolve) => setTimeout(resolve, 200));
+    const generatedId = `x_tweet_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
     return {
-      platform_post_id: `x_tweet_${Date.now()}_${Math.floor(Math.random() * 1000)}`
+      success: true,
+      externalPostId: generatedId,
+      platform_post_id: generatedId,
     };
   }
 

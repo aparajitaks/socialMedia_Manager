@@ -1,51 +1,81 @@
-export type UserRole = 'admin' | 'editor';
+export type PlatformType = 'google_business' | 'linkedin' | 'facebook' | 'instagram' | 'x';
+export type UserRole = 'owner' | 'admin' | 'member';
+export type PostStatus = 'scheduled' | 'publishing' | 'published' | 'failed' | 'draft';
+export type SocialAccountStatus = 'connected' | 'expired' | 'revoked';
+
+export interface Organization {
+  id: string;
+  name: string;
+  created_at: string;
+}
 
 export interface User {
   id: string;
-  name: string;
+  organization_id: string;
   email: string;
   role: UserRole;
+  name?: string;
   created_at: string;
 }
 
-export type PlatformType = 'linkedin' | 'google_business' | 'facebook' | 'instagram' | 'x';
+export interface Client {
+  id: string;
+  organization_id: string;
+  name: string;
+  created_at: string;
+}
 
 export interface SocialAccount {
   id: string;
+  client_id: string;
   platform: PlatformType;
-  display_name: string;
   external_account_id: string;
-  access_token: string; // Stored encrypted
-  refresh_token?: string | null;
+  external_account_name?: string | null;
+  external_username?: string | null;
+  display_name?: string; // UI friendly alias
+  access_token_encrypted: string;
+  refresh_token_encrypted?: string | null;
   token_expires_at?: string | null;
+  scopes?: string[] | null;
+  status: SocialAccountStatus;
   connected_by?: string | null;
-  connected_at: string;
+  created_at: string;
+  updated_at: string;
+
+  // Runtime-decrypted convenience fields (never stored, never sent to browser)
+  access_token?: string;
+  refresh_token?: string | null;
 }
 
-export interface PostGroup {
+export interface OAuthState {
   id: string;
-  label?: string | null;
-  created_by?: string | null;
+  state: string;
+  user_id: string;
+  client_id: string;
+  platform: PlatformType;
+  expires_at: string;
   created_at: string;
 }
 
-export type PostStatus = 'draft' | 'scheduled' | 'publishing' | 'published' | 'failed';
-
 export interface Post {
   id: string;
-  post_group_id?: string | null;
+  client_id: string;
   social_account_id: string;
   platform: PlatformType;
   content: string;
   media_urls?: string[] | null;
-  status: PostStatus;
   scheduled_at?: string | null;
-  published_at?: string | null;
+  status: PostStatus;
+  external_post_id?: string | null;
   platform_post_id?: string | null;
+  post_group_id?: string | null;
+  error_message?: string | null;
   error_reason?: string | null;
   approved_by?: string | null;
+  published_at?: string | null;
   created_by?: string | null;
   created_at: string;
+  updated_at: string;
 }
 
 export interface PostMetric {
@@ -58,20 +88,31 @@ export interface PostMetric {
   impressions: number;
 }
 
-export interface PlatformMetricsSummary {
-  platform: PlatformType;
-  total_likes: number;
-  total_comments: number;
-  total_shares: number;
-  total_impressions: number;
+export interface PublishResult {
+  success: boolean;
+  externalPostId?: string;
+  error?: string;
 }
 
-export interface CreatePostPayload {
-  label?: string;
-  accounts: {
-    social_account_id: string;
-    content: string;
-    media_urls?: string[];
-  }[];
-  scheduled_at?: string;
+export interface PostMetrics {
+  likes: number;
+  comments: number;
+  shares: number;
+  impressions: number;
+}
+
+export interface AccountDiscoveryItem {
+  id: string;
+  name: string;
+  username?: string;
+  platform: PlatformType;
+  details?: string;
+  hasInstagramBusiness?: boolean;
+  instagramAccountId?: string;
+}
+
+export interface SocialPublisher {
+  publish(post: Post, account: SocialAccount): Promise<PublishResult>;
+  refreshToken(account: SocialAccount): Promise<SocialAccount>;
+  fetchMetrics(post: Post, account: SocialAccount): Promise<PostMetrics>;
 }
