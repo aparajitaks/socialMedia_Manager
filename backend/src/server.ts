@@ -148,6 +148,26 @@ async function runSchedulerLoop() {
 }
 
 // ---------------------------------------------------------------------------
+// Server-side Worker Loop — Phase 3 (PostgreSQL-backed publishing engine)
+//
+// Runs every 30 seconds to claim and execute SCHEDULED / RETRYING jobs.
+// Uses SELECT ... FOR UPDATE SKIP LOCKED so multiple instances are safe.
+// ---------------------------------------------------------------------------
+async function runWorkerLoop() {
+  try {
+    const { publishingQueueWorker } = await import('./queue/publisher-worker.js');
+    const stats = await publishingQueueWorker.processDueJobs();
+    if (stats.processed > 0) {
+      console.log(
+        `🚀 Worker: processed=${stats.processed} completed=${stats.completed} failed=${stats.failed} retried=${stats.retried}${stats.recovered ? ` recovered=${stats.recovered}` : ''}`
+      );
+    }
+  } catch (err: any) {
+    console.error('Worker loop error:', err.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Server-side Metrics Sync Loop
 //
 // Fetches updated engagement metrics from each platform every 15 minutes.
@@ -200,13 +220,16 @@ app.listen(PORT, () => {
   console.log(`🚀 Social Scheduler Backend running on http://localhost:${PORT}`);
   console.log(`📡 Persistence: ${process.env.NEXT_PUBLIC_SUPABASE_URL ? 'Supabase Postgres' : 'Local JSON (configure .env.local for Supabase)'}`);
 
-  // Kick off scheduler loop every 60 seconds
+  // Kick off scheduler loop every 60 seconds (creates publish_jobs for due posts)
   setInterval(runSchedulerLoop, 60_000);
+  // Kick off worker loop every 30 seconds (processes queued publish_jobs)
+  setInterval(runWorkerLoop, 30_000);
   // Kick off metrics sync every 15 minutes
   setInterval(runMetricsSyncLoop, 15 * 60_000);
 
   // Run once at startup to catch any posts that were due while server was down
   setTimeout(runSchedulerLoop, 5000);
+  setTimeout(runWorkerLoop, 8000);
   setTimeout(runMetricsSyncLoop, 10000);
 });
 

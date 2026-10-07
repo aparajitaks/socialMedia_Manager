@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { db } from '../db.js';
 import { getPublisher, classifyPlatformError } from '../publishers/index.js';
+import { decryptToken } from '../crypto.js';
 import {
   Post,
   PostVariant,
@@ -8,6 +9,7 @@ import {
   PublishAttempt,
   SocialAccount,
   ErrorCategory,
+  PostStatus,
 } from '../types/index.js';
 
 export interface WorkerCycleStats {
@@ -15,6 +17,7 @@ export interface WorkerCycleStats {
   completed: number;
   failed: number;
   retried: number;
+  recovered?: number;
   skipped: boolean;
   reason?: string;
   results: Array<{
@@ -26,17 +29,23 @@ export interface WorkerCycleStats {
   }>;
 }
 
-const WORKER_ID = `worker_${process.pid}_${Math.random().toString(36).slice(2, 7)}`;
-let isShuttingDown = false;
-
 export class PublishingQueueWorker {
+  public workerId: string;
+  public staleThresholdMs: number;
+  public isShuttingDown: boolean = false;
+
+  constructor(options?: { workerId?: string; staleThresholdMs?: number }) {
+    this.workerId = options?.workerId || `worker_${process.pid}_${Math.random().toString(36).slice(2, 7)}`;
+    this.staleThresholdMs = options?.staleThresholdMs || parseInt(process.env.WORKER_STALE_THRESHOLD_MS || '300000', 10);
+  }
+
   /**
    * Enqueue a scheduled post into the publish_jobs queue with idempotency protection.
    */
   async enqueuePost(post: Post, variantId?: string): Promise<PublishJob> {
     const scheduledAt = post.scheduled_at || new Date().toISOString();
-    // Unique deterministic key to prevent duplicate publishing
-    const idempotencyKey = `idemp_${post.id}_${post.social_account_id}_${new Date(scheduledAt).getTime()}`;
+    // Unique deterministic key to prevent duplicate publishing (§19)
+    const idempotencyKey = `idemp_${post.id}_${variantId || post.social_account_id}_${new Date(scheduledAt).getTime()}`;
 
     // Check if job already exists using the idempotency key
     const existingJob = await db.getPublishJobByIdempotencyKey(idempotencyKey);
@@ -56,6 +65,55 @@ export class PublishingQueueWorker {
     });
 
     return job;
+  }
+
+  /**
+   * Post Status Synchronization (§24, §25)
+   * Computes parent post status based on all child publish jobs.
+   */
+  async syncPostStatusFromJobs(postId: string): Promise<void> {
+    const post = await db.getPost(postId);
+    if (!post) return;
+
+    const allJobs = await db.getPublishJobs({ postId });
+    if (allJobs.length === 0) return;
+
+    const isJobDone = (j: PublishJob) => j.status === 'PUBLISHED' || j.status === 'COMPLETED';
+    const isJobFailed = (j: PublishJob) => j.status === 'FAILED';
+    const isJobProcessing = (j: PublishJob) => j.status === 'PROCESSING';
+    const isJobRetrying = (j: PublishJob) => j.status === 'RETRYING';
+    const isJobScheduled = (j: PublishJob) => j.status === 'SCHEDULED' || j.status === 'QUEUED';
+
+    const doneCount = allJobs.filter(isJobDone).length;
+    const failedCount = allJobs.filter(isJobFailed).length;
+    const processingCount = allJobs.filter(isJobProcessing).length;
+    const retryingCount = allJobs.filter(isJobRetrying).length;
+    const scheduledCount = allJobs.filter(isJobScheduled).length;
+
+    let targetStatus: PostStatus = post.status;
+    let publishedAt: string | null = post.published_at || null;
+
+    if (doneCount === allJobs.length) {
+      targetStatus = 'published';
+      publishedAt = publishedAt || new Date().toISOString();
+    } else if (processingCount > 0) {
+      targetStatus = 'publishing';
+    } else if (doneCount > 0 && failedCount > 0 && doneCount + failedCount === allJobs.length) {
+      // Partial success (§25): at least one variant published, don't rollback
+      targetStatus = 'published';
+      publishedAt = publishedAt || new Date().toISOString();
+    } else if (failedCount === allJobs.length) {
+      targetStatus = 'failed';
+    } else if (retryingCount > 0) {
+      targetStatus = 'retrying';
+    } else if (scheduledCount > 0 && doneCount === 0) {
+      targetStatus = 'scheduled';
+    }
+
+    await db.updatePost(postId, {
+      status: targetStatus,
+      published_at: publishedAt,
+    });
   }
 
   /**
@@ -93,7 +151,7 @@ export class PublishingQueueWorker {
       return { success: false, error: errReason, errorCategory: 'ACCOUNT_DISCONNECTED' };
     }
 
-    // Account status check
+    // Account status check (§30)
     const upperStatus = String(account.status || '').toUpperCase();
     if (upperStatus === 'DISCONNECTED' || upperStatus === 'REAUTH_REQUIRED' || upperStatus === 'REVOKED' || upperStatus === 'NEEDS_RECONNECT') {
       const msg = `Account connection revoked or invalid. Reconnection required.`;
@@ -123,35 +181,53 @@ export class PublishingQueueWorker {
 
     const publisher = getPublisher(job.platform || post.platform || account.platform);
 
+    // Decrypt access token server-side (§29: never leak to frontend or logs)
+    let token = account.access_token || '';
+    if (!token && (account.encrypted_access_token || (account as any).access_token_encrypted)) {
+      try {
+        const cipher = account.encrypted_access_token || (account as any).access_token_encrypted;
+        token = decryptToken(cipher);
+      } catch (decErr: any) {
+        console.error(`[Worker ${this.workerId}] Failed to decrypt token for account ${account.id}:`, decErr.message);
+      }
+    }
+
+    const accountForPublish = {
+      ...account,
+      access_token: token,
+    };
+
     // Proactive token refresh if expiring within 24 hours
     if (
       account.token_expires_at &&
       new Date(account.token_expires_at).getTime() < Date.now() + 24 * 60 * 60 * 1000
     ) {
       try {
-        const refreshRes = await publisher.refreshToken(account);
+        const refreshRes = await publisher.refreshToken(accountForPublish);
         if (refreshRes) {
           await db.updateSocialAccount(account.id, {
             access_token: refreshRes.access_token,
             token_expires_at: refreshRes.token_expires_at || account.token_expires_at,
           });
+          accountForPublish.access_token = refreshRes.access_token;
         }
       } catch (refErr: any) {
-        console.warn(`Proactive token refresh error for account ${account.id}:`, refErr.message);
+        console.warn(`[Worker ${this.workerId}] Proactive token refresh error for account ${account.id}:`, refErr.message);
       }
     }
 
     // Execute publish
     try {
-      // Pre-publishing validation
+      // Pre-publishing content & media revalidation (§31, §32)
       if (publisher.validatePost) {
-        const validation = publisher.validatePost(postToPublish, account);
+        const validation = publisher.validatePost(postToPublish, accountForPublish);
         if (!validation.valid) {
-          throw new Error(`Validation failed: ${validation.errors.join('; ')}`);
+          throw new Error(`Pre-publish validation failed: ${validation.errors.join('; ')}`);
         }
       }
 
-      const publishResult = await publisher.publish(postToPublish, account);
+      console.log(`[Worker ${this.workerId}] Publishing job ${job.id} on ${job.platform} for post ${post.id}...`);
+      const publishResult = await publisher.publish(postToPublish, accountForPublish);
       const extId =
         publishResult.externalPostId ||
         publishResult.platform_post_id ||
@@ -159,7 +235,7 @@ export class PublishingQueueWorker {
 
       const completedAt = new Date().toISOString();
 
-      // Record successful attempt
+      // Record successful attempt with clean payload (§20, §29)
       await db.createPublishAttempt({
         job_id: job.id,
         attempt_number: (job.attempt_count || 0) + 1,
@@ -167,24 +243,13 @@ export class PublishingQueueWorker {
         response_payload: { externalPostId: extId },
       });
 
-      // Mark job completed
+      // Mark job published/completed
       await db.updatePublishJob(job.id, {
-        status: 'COMPLETED',
+        status: 'PUBLISHED',
         completed_at: completedAt,
         locked_at: null,
         locked_by: null,
         last_error: null,
-      });
-
-      // Mark post published
-      await db.updatePost(post.id, {
-        status: 'published',
-        published_at: completedAt,
-        external_post_id: extId,
-        platform_post_id: extId,
-        error_message: null,
-        error_reason: null,
-        error_category: null,
       });
 
       // If variant, mark variant published
@@ -193,13 +258,24 @@ export class PublishingQueueWorker {
           status: 'published',
           external_post_id: extId,
         });
+      } else {
+        // No variant — write platform_post_id directly onto the post
+        await db.updatePost(post.id, {
+          platform_post_id: extId,
+        });
       }
 
+      // Sync overall post status (updates status + published_at)
+      await this.syncPostStatusFromJobs(post.id);
+
+      console.log(`[Worker ${this.workerId}] Succeeded publishing job ${job.id} -> external ID ${extId}`);
       return { success: true };
     } catch (pubErr: any) {
       const classified = classifyPlatformError(pubErr);
       const attemptCount = (job.attempt_count || 0) + 1;
       const maxAttempts = job.max_attempts || 3;
+
+      console.warn(`[Worker ${this.workerId}] Failed publishing job ${job.id}: category=${classified.category}, retryable=${classified.retryable}`);
 
       // Record failed attempt
       await db.createPublishAttempt({
@@ -231,9 +307,9 @@ export class PublishingQueueWorker {
         });
       }
 
-      // Retry logic: if retryable and under max attempts
+      // Retry logic (§18): if retryable and under max attempts
       if (classified.retryable && attemptCount < maxAttempts) {
-        // Exponential backoff: 1min, 5min, 15min, 30min, 60min
+        // Exponential backoff: bounded (1m, 2m, 4m, 8m... max 60m)
         const delayMinutes = Math.min(Math.pow(2, attemptCount - 1) * 1, 60);
         const delayMs = delayMinutes * 60 * 1000;
         const nextRetryAt = new Date(Date.now() + delayMs).toISOString();
@@ -257,7 +333,14 @@ export class PublishingQueueWorker {
 
         return { success: false, error: classified.message, errorCategory: classified.category };
       } else {
-        // Permanent failure
+        // Permanent failure — update post with error details first, then sync
+        await db.updatePost(post.id, {
+          status: 'failed',
+          error_message: classified.message,
+          error_reason: classified.message,
+          error_category: classified.category,
+        });
+
         await db.updatePublishJob(job.id, {
           status: 'FAILED',
           attempt_count: attemptCount,
@@ -267,13 +350,6 @@ export class PublishingQueueWorker {
           locked_by: null,
         });
 
-        await db.updatePost(post.id, {
-          status: 'failed',
-          error_message: classified.message,
-          error_reason: classified.message,
-          error_category: classified.category,
-        });
-
         if (job.variant_id) {
           await db.updatePostVariant(job.variant_id, {
             status: 'failed',
@@ -281,6 +357,8 @@ export class PublishingQueueWorker {
             error_category: classified.category,
           });
         }
+
+        await this.syncPostStatusFromJobs(post.id);
 
         // Create notification for failed post
         await db.createNotification({
@@ -302,7 +380,7 @@ export class PublishingQueueWorker {
    * Uses PostgreSQL row-level locking via claimPublishJob to prevent race conditions.
    */
   async processDueJobs(): Promise<WorkerCycleStats> {
-    if (isShuttingDown) {
+    if (this.isShuttingDown) {
       return {
         processed: 0,
         completed: 0,
@@ -324,24 +402,30 @@ export class PublishingQueueWorker {
     };
 
     try {
-      // 1. Ensure any due legacy posts without jobs are enqueued
+      // 1. Stale Job Recovery watchdog (§12)
+      const recovery = await db.recoverStaleJobs(this.staleThresholdMs);
+      if (recovery.recoveredCount > 0) {
+        console.log(`[Worker ${this.workerId}] Watchdog recovered ${recovery.recoveredCount} stale job(s): ${recovery.recoveredIds.join(', ')}`);
+        stats.recovered = recovery.recoveredCount;
+      }
+
+      // 2. Ensure any due legacy posts without jobs are enqueued
       const duePosts = await db.getDueScheduledPosts();
       for (const p of duePosts) {
         await this.enqueuePost(p);
       }
 
-      // 2. Process jobs one at a time using atomic claiming
-      // Continue claiming and processing until no more jobs are available
+      // 3. Process jobs one at a time using atomic claiming (§9, §10)
       let job;
       let processedCount = 0;
-      const maxJobsPerCycle = 100; // Prevent infinite loops in case of bugs
+      const maxJobsPerCycle = 100; // Bounded batch per cycle
 
-      while (processedCount < maxJobsPerCycle && !isShuttingDown) {
-        // Atomically claim a job
-        job = await db.claimPublishJob(WORKER_ID);
+      while (processedCount < maxJobsPerCycle && !this.isShuttingDown) {
+        // Atomically claim a due job with FOR UPDATE SKIP LOCKED
+        job = await db.claimPublishJob(this.workerId, this.staleThresholdMs);
 
         if (!job) {
-          // No more jobs available
+          // No more due jobs available
           break;
         }
 
@@ -359,7 +443,7 @@ export class PublishingQueueWorker {
               status: 'COMPLETED',
             });
           } else {
-            // Check if it was a retry or permanent failure
+            // Check status of updated job
             const updatedJob = await db.getPublishJob(job.id);
             if (updatedJob?.status === 'RETRYING') {
               stats.retried++;
@@ -382,8 +466,7 @@ export class PublishingQueueWorker {
             }
           }
         } catch (err: any) {
-          // Unexpected error during processing
-          console.error(`Unexpected error processing job ${job.id}:`, err);
+          console.error(`[Worker ${this.workerId}] Unexpected error processing job ${job.id}:`, err);
           await db.updatePublishJob(job.id, {
             status: 'FAILED',
             last_error: `Unexpected error: ${err.message}`,
@@ -403,7 +486,7 @@ export class PublishingQueueWorker {
 
       return stats;
     } catch (err: any) {
-      console.error('Error in processDueJobs:', err);
+      console.error(`[Worker ${this.workerId}] Error in processDueJobs:`, err);
       return {
         ...stats,
         skipped: true,
@@ -414,21 +497,10 @@ export class PublishingQueueWorker {
 
   /**
    * Gracefully shutdown the worker.
-   * Sets a flag to prevent new job claims and releases any held locks.
    */
   async shutdown(): Promise<void> {
-    isShuttingDown = true;
-    console.log(`Worker ${WORKER_ID} shutting down...`);
-
-    // Release any locks held by this worker
-    try {
-      const now = new Date().toISOString();
-      // Update any jobs still locked by this worker to release the lock
-      // In production, you might want to add a db method for this
-      console.log(`Worker ${WORKER_ID} shutdown complete`);
-    } catch (err) {
-      console.error('Error during worker shutdown:', err);
-    }
+    this.isShuttingDown = true;
+    console.log(`Worker ${this.workerId} shutting down...`);
   }
 
   /**
@@ -436,8 +508,8 @@ export class PublishingQueueWorker {
    */
   getHealth(): { workerId: string; isShuttingDown: boolean } {
     return {
-      workerId: WORKER_ID,
-      isShuttingDown,
+      workerId: this.workerId,
+      isShuttingDown: this.isShuttingDown,
     };
   }
 }

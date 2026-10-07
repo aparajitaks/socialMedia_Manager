@@ -17,6 +17,7 @@ import {
   MediaAsset,
   PublishJob,
   PublishAttempt,
+  PublishJobStatus,
   ContentLibrary,
   LibraryPost,
   RecurringSchedule,
@@ -1293,6 +1294,18 @@ export const db = {
     return current.approvals[idx];
   },
 
+  // Valid state transitions for PublishJob state machine (§4, §21)
+  VALID_JOB_TRANSITIONS: {
+    SCHEDULED: ['PROCESSING', 'CANCELLED', 'SCHEDULED'],
+    QUEUED: ['PROCESSING', 'CANCELLED', 'SCHEDULED'],
+    PROCESSING: ['PUBLISHED', 'COMPLETED', 'FAILED', 'RETRYING', 'SCHEDULED'],
+    RETRYING: ['PROCESSING', 'CANCELLED', 'SCHEDULED'],
+    FAILED: ['RETRYING', 'SCHEDULED', 'PROCESSING'], // manual retry
+    PUBLISHED: [],
+    COMPLETED: [],
+    CANCELLED: [],
+  } as Record<string, string[]>,
+
   // Publishing Queue (PublishJob & PublishAttempt)
   async createPublishJob(data: Partial<PublishJob>): Promise<PublishJob> {
     const now = new Date().toISOString();
@@ -1304,8 +1317,8 @@ export const db = {
       social_account_id: data.social_account_id!,
       platform: data.platform!,
       scheduled_at: data.scheduled_at || now,
-      status: data.status || 'SCHEDULED',
-      idempotency_key: data.idempotency_key || `job_${data.post_id}_${data.social_account_id}_${Date.now()}`,
+      status: (data.status as PublishJobStatus) || 'SCHEDULED',
+      idempotency_key: data.idempotency_key || `job_${data.post_id}_${data.variant_id || data.social_account_id}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       attempt_count: data.attempt_count || 0,
       max_attempts: data.max_attempts || 3,
       locked_at: null,
@@ -1330,6 +1343,60 @@ export const db = {
     return job;
   },
 
+  /**
+   * Transactional batch creation of publish jobs (§6)
+   * Rolls back if any job cannot be created or has a duplicate idempotency key.
+   */
+  async createPublishJobsTransaction(jobsData: Partial<PublishJob>[]): Promise<PublishJob[]> {
+    if (!jobsData || jobsData.length === 0) return [];
+    const now = new Date().toISOString();
+
+    const jobsToInsert: PublishJob[] = jobsData.map((data) => ({
+      id: data.id || crypto.randomUUID(),
+      post_id: data.post_id!,
+      variant_id: data.variant_id || null,
+      client_id: data.client_id || DEFAULT_CLIENT_ID,
+      social_account_id: data.social_account_id!,
+      platform: data.platform!,
+      scheduled_at: data.scheduled_at || now,
+      status: (data.status as PublishJobStatus) || 'SCHEDULED',
+      idempotency_key: data.idempotency_key || `job_${data.post_id}_${data.variant_id || data.social_account_id}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      attempt_count: data.attempt_count || 0,
+      max_attempts: data.max_attempts || 3,
+      locked_at: null,
+      locked_by: null,
+      started_at: null,
+      completed_at: null,
+      next_retry_at: null,
+      last_error: null,
+      error_category: null,
+      created_at: now,
+      updated_at: now,
+    }));
+
+    if (supabase) {
+      const { data: created, error } = await supabase.from('publish_jobs').insert(jobsToInsert).select();
+      if (error) sbError('createPublishJobsTransaction', error);
+      return created || [];
+    }
+
+    const current = readLocalDB();
+    if (!current.publish_jobs) current.publish_jobs = [];
+
+    // Verify uniqueness of idempotency keys before inserting
+    const existingKeys = new Set(current.publish_jobs.map((j) => j.idempotency_key));
+    for (const job of jobsToInsert) {
+      if (existingKeys.has(job.idempotency_key)) {
+        throw new Error(`Duplicate publish job idempotency key: '${job.idempotency_key}'`);
+      }
+      existingKeys.add(job.idempotency_key);
+    }
+
+    current.publish_jobs.push(...jobsToInsert);
+    await writeLocalDB(current);
+    return jobsToInsert;
+  },
+
   async getDuePublishJobs(): Promise<PublishJob[]> {
     const nowIso = new Date().toISOString();
     if (supabase) {
@@ -1338,91 +1405,163 @@ export const db = {
         .select('*')
         .in('status', ['SCHEDULED', 'RETRYING'])
         .lte('scheduled_at', nowIso)
-        .is('locked_at', null);
+        .is('locked_at', null)
+        .order('scheduled_at', { ascending: true });
       if (error) sbError('getDuePublishJobs', error);
       return data || [];
     }
     const now = Date.now();
-    return (readLocalDB().publish_jobs || []).filter(
-      (j) =>
-        (j.status === 'SCHEDULED' || j.status === 'RETRYING') &&
-        !j.locked_at &&
-        new Date(j.scheduled_at).getTime() <= now &&
-        (!j.next_retry_at || new Date(j.next_retry_at).getTime() <= now)
-    );
+    return (readLocalDB().publish_jobs || [])
+      .filter(
+        (j) =>
+          (j.status === 'SCHEDULED' || j.status === 'RETRYING') &&
+          !j.locked_at &&
+          new Date(j.scheduled_at).getTime() <= now &&
+          (!j.next_retry_at || new Date(j.next_retry_at).getTime() <= now)
+      )
+      .sort((a, b) => new Date(a.scheduled_at).getTime() - new Date(b.scheduled_at).getTime());
+  },
+
+  /**
+   * Stale Job Recovery (§12)
+   * Detects and resets jobs stuck in PROCESSING where locked_at is older than staleThresholdMs.
+   */
+  async recoverStaleJobs(staleThresholdMs: number = 300_000): Promise<{ recoveredCount: number; recoveredIds: string[] }> {
+    const now = Date.now();
+    const staleCutoffIso = new Date(now - staleThresholdMs).toISOString();
+
+    if (supabase) {
+      const { data: staleJobs, error: findError } = await supabase
+        .from('publish_jobs')
+        .select('*')
+        .eq('status', 'PROCESSING')
+        .not('locked_at', 'is', null)
+        .lt('locked_at', staleCutoffIso);
+
+      if (findError || !staleJobs || staleJobs.length === 0) {
+        return { recoveredCount: 0, recoveredIds: [] };
+      }
+
+      const recoveredIds: string[] = [];
+      for (const job of staleJobs) {
+        const { error: updateError } = await supabase
+          .from('publish_jobs')
+          .update({
+            status: 'RETRYING',
+            locked_at: null,
+            locked_by: null,
+            last_error: `Worker lock timed out after ${Math.floor(staleThresholdMs / 1000)}s - recovered by watchdog`,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', job.id);
+
+        if (!updateError) recoveredIds.push(job.id);
+      }
+
+      return { recoveredCount: recoveredIds.length, recoveredIds };
+    }
+
+    const current = readLocalDB();
+    const cutoffTime = now - staleThresholdMs;
+    const recoveredIds: string[] = [];
+
+    for (let i = 0; i < (current.publish_jobs || []).length; i++) {
+      const job = current.publish_jobs[i];
+      if (
+        job.status === 'PROCESSING' &&
+        job.locked_at &&
+        new Date(job.locked_at).getTime() < cutoffTime
+      ) {
+        current.publish_jobs[i] = {
+          ...job,
+          status: 'RETRYING',
+          locked_at: null,
+          locked_by: null,
+          last_error: `Worker lock timed out after ${Math.floor(staleThresholdMs / 1000)}s - recovered by watchdog`,
+          updated_at: new Date().toISOString(),
+        };
+        recoveredIds.push(job.id);
+      }
+    }
+
+    if (recoveredIds.length > 0) {
+      await writeLocalDB(current);
+    }
+
+    return { recoveredCount: recoveredIds.length, recoveredIds };
   },
 
   /**
    * Atomically claim a due publish job using PostgreSQL row-level locking.
    * Uses SELECT ... FOR UPDATE SKIP LOCKED to prevent race conditions between workers.
-   * Returns the claimed job or null if no jobs are available.
+   * Incorporates stale lock recovery for crashed workers (§10, §12).
    */
-  async claimPublishJob(workerId: string): Promise<PublishJob | null> {
+  async claimPublishJob(workerId: string, staleThresholdMs: number = 300_000): Promise<PublishJob | null> {
     const nowIso = new Date().toISOString();
+    const nowMs = Date.now();
+    const staleCutoffMs = nowMs - staleThresholdMs;
 
     if (supabase) {
-      // Use PostgreSQL's SELECT FOR UPDATE SKIP LOCKED for atomic job claiming
       const { data: claimedJob, error: selectError } = await supabase.rpc('claim_publish_job', {
         p_worker_id: workerId,
         p_now: nowIso,
+        p_stale_threshold_seconds: Math.floor(staleThresholdMs / 1000),
       });
 
-      if (selectError) {
-        // If the RPC function doesn't exist, fall back to client-side logic
-        console.warn('claim_publish_job RPC not found, using fallback logic');
-        const { data, error } = await supabase
-          .from('publish_jobs')
-          .select('*')
-          .in('status', ['SCHEDULED', 'RETRYING'])
-          .lte('scheduled_at', nowIso)
-          .is('locked_at', null)
-          .limit(1)
-          .maybeSingle();
-
-        if (error || !data) return null;
-
-        // Try to update - if another worker claimed it, this will fail
-        const { data: updated, error: updateError } = await supabase
-          .from('publish_jobs')
-          .update({
-            status: 'PROCESSING',
-            locked_at: nowIso,
-            locked_by: workerId,
-            started_at: nowIso,
-            updated_at: nowIso,
-          })
-          .eq('id', data.id)
-          .is('locked_at', null)
-          .select()
-          .maybeSingle();
-
-        if (updateError || !updated) return null;
-        return updated;
+      if (!selectError && claimedJob) {
+        return Array.isArray(claimedJob) ? claimedJob[0] || null : claimedJob;
       }
 
-      return claimedJob || null;
+      // Fallback if RPC function is not deployed:
+      const staleCutoffIso = new Date(staleCutoffMs).toISOString();
+      const { data: candidate, error: candError } = await supabase
+        .from('publish_jobs')
+        .select('*')
+        .or(`and(status.in.(SCHEDULED,RETRYING),locked_at.is.null),and(status.eq.PROCESSING,locked_at.lt.${staleCutoffIso})`)
+        .lte('scheduled_at', nowIso)
+        .order('scheduled_at', { ascending: true })
+        .limit(1)
+        .maybeSingle();
+
+      if (candError || !candidate) return null;
+
+      const { data: updated, error: updateError } = await supabase
+        .from('publish_jobs')
+        .update({
+          status: 'PROCESSING',
+          locked_at: nowIso,
+          locked_by: workerId,
+          started_at: nowIso,
+          updated_at: nowIso,
+        })
+        .eq('id', candidate.id)
+        .select()
+        .maybeSingle();
+
+      if (updateError || !updated) return null;
+      return updated;
     }
 
-    // Local DB fallback: simulate atomic claim with check-and-set
+    // Local DB fallback: simulate atomic claim with check-and-set and stale recovery
     const current = readLocalDB();
-    const now = Date.now();
-    const availableJob = (current.publish_jobs || []).find(
-      (j) =>
-        (j.status === 'SCHEDULED' || j.status === 'RETRYING') &&
-        !j.locked_at &&
-        new Date(j.scheduled_at).getTime() <= now &&
-        (!j.next_retry_at || new Date(j.next_retry_at).getTime() <= now)
-    );
+    const eligibleJobs = (current.publish_jobs || [])
+      .filter((j) => {
+        const isDue = new Date(j.scheduled_at).getTime() <= nowMs;
+        const retryReady = !j.next_retry_at || new Date(j.next_retry_at).getTime() <= nowMs;
+        if (!isDue || !retryReady) return false;
 
-    if (!availableJob) return null;
+        const isFresh = (j.status === 'SCHEDULED' || j.status === 'RETRYING') && !j.locked_at;
+        const isStale = j.status === 'PROCESSING' && j.locked_at && new Date(j.locked_at).getTime() < staleCutoffMs;
+        return isFresh || isStale;
+      })
+      .sort((a, b) => new Date(a.scheduled_at).getTime() - new Date(b.scheduled_at).getTime());
 
-    const idx = current.publish_jobs.findIndex((j) => j.id === availableJob.id);
+    if (eligibleJobs.length === 0) return null;
+
+    const chosen = eligibleJobs[0];
+    const idx = current.publish_jobs.findIndex((j) => j.id === chosen.id);
     if (idx === -1) return null;
 
-    // Double-check it's still unlocked (race condition check)
-    if (current.publish_jobs[idx].locked_at) return null;
-
-    // Claim the job
     current.publish_jobs[idx] = {
       ...current.publish_jobs[idx],
       status: 'PROCESSING',
@@ -1458,8 +1597,66 @@ export const db = {
     return (readLocalDB().publish_jobs || []).find((j) => j.id === id) || null;
   },
 
+  async getPublishJobs(filter?: { clientId?: string; status?: string; postId?: string; limit?: number }): Promise<PublishJob[]> {
+    if (supabase) {
+      let query = supabase.from('publish_jobs').select('*');
+      if (filter?.clientId) query = query.eq('client_id', filter.clientId);
+      if (filter?.status) query = query.eq('status', filter.status);
+      if (filter?.postId) query = query.eq('post_id', filter.postId);
+      if (filter?.limit) query = query.limit(filter.limit);
+      const { data, error } = await query.order('scheduled_at', { ascending: false });
+      if (error) sbError('getPublishJobs', error);
+      return data || [];
+    }
+    let jobs = readLocalDB().publish_jobs || [];
+    if (filter?.clientId) jobs = jobs.filter((j) => j.client_id === filter.clientId);
+    if (filter?.status) jobs = jobs.filter((j) => j.status === filter.status);
+    if (filter?.postId) jobs = jobs.filter((j) => j.post_id === filter.postId);
+    jobs = [...jobs].sort((a, b) => new Date(b.scheduled_at).getTime() - new Date(a.scheduled_at).getTime());
+    if (filter?.limit) jobs = jobs.slice(0, filter.limit);
+    return jobs;
+  },
+
+  async cancelPublishJob(id: string, callerOrgId?: string): Promise<PublishJob> {
+    const job = await this.getPublishJob(id);
+    if (!job) throw new Error(`Publish job '${id}' not found`);
+
+    if (callerOrgId) {
+      const client = await this.getClient(job.client_id);
+      if (!client || client.organization_id !== callerOrgId) {
+        throw new Error(`Unauthorized: Client does not belong to organization`);
+      }
+    }
+
+    if (job.status === 'PROCESSING') {
+      throw new Error(`Cannot cancel a publish job that is currently PROCESSING by a worker`);
+    }
+
+    if (job.status === 'PUBLISHED' || job.status === 'COMPLETED') {
+      throw new Error(`Cannot cancel an already published job`);
+    }
+
+    return await this.updatePublishJob(id, {
+      status: 'CANCELLED',
+      locked_at: null,
+      locked_by: null,
+    });
+  },
+
   async updatePublishJob(id: string, patch: Partial<PublishJob>): Promise<PublishJob> {
     const now = new Date().toISOString();
+
+    // Enforce state machine transitions (§21)
+    if (patch.status) {
+      const existing = await this.getPublishJob(id);
+      if (existing && existing.status !== patch.status) {
+        const allowed = this.VALID_JOB_TRANSITIONS[existing.status] || [];
+        if (!allowed.includes(patch.status)) {
+          throw new Error(`Invalid job status transition: cannot change status from '${existing.status}' to '${patch.status}'`);
+        }
+      }
+    }
+
     if (supabase) {
       const { data, error } = await supabase.from('publish_jobs').update({ ...patch, updated_at: now }).eq('id', id).select().single();
       if (error) sbError('updatePublishJob', error);
@@ -1474,6 +1671,21 @@ export const db = {
   },
 
   async createPublishAttempt(data: Partial<PublishAttempt>): Promise<PublishAttempt> {
+    // Sanitize response payload to prevent any secrets from entering DB/logs (§20, §29)
+    const sanitizeAttemptPayload = (payload: any): any => {
+      if (!payload || typeof payload !== 'object') return payload;
+      const sanitized = Array.isArray(payload) ? [...payload] : { ...payload };
+      const sensitiveKeys = ['token', 'access_token', 'accessToken', 'refreshToken', 'refresh_token', 'secret', 'password', 'key'];
+      for (const k of Object.keys(sanitized)) {
+        if (sensitiveKeys.some((s) => k.toLowerCase().includes(s))) {
+          sanitized[k] = '[REDACTED]';
+        } else if (typeof sanitized[k] === 'object') {
+          sanitized[k] = sanitizeAttemptPayload(sanitized[k]);
+        }
+      }
+      return sanitized;
+    };
+
     const attempt: PublishAttempt = {
       id: crypto.randomUUID(),
       job_id: data.job_id!,
@@ -1482,7 +1694,7 @@ export const db = {
       error_message: data.error_message || null,
       error_category: data.error_category || null,
       executed_at: new Date().toISOString(),
-      response_payload: data.response_payload || null,
+      response_payload: sanitizeAttemptPayload(data.response_payload) || null,
     };
     if (supabase) {
       const { data: created, error } = await supabase.from('publish_attempts').insert(attempt).select().single();

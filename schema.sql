@@ -173,7 +173,7 @@ CREATE TABLE IF NOT EXISTS publish_jobs (
   social_account_id UUID NOT NULL REFERENCES social_accounts(id) ON DELETE CASCADE,
   platform TEXT NOT NULL,
   scheduled_at TIMESTAMPTZ NOT NULL,
-  status TEXT NOT NULL DEFAULT 'SCHEDULED' CHECK (status IN ('SCHEDULED', 'QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED', 'RETRYING', 'CANCELLED')),
+  status TEXT NOT NULL DEFAULT 'SCHEDULED' CHECK (status IN ('SCHEDULED', 'QUEUED', 'PROCESSING', 'COMPLETED', 'PUBLISHED', 'FAILED', 'RETRYING', 'CANCELLED')),
   idempotency_key TEXT NOT NULL UNIQUE,
   attempt_count INT NOT NULL DEFAULT 0,
   max_attempts INT NOT NULL DEFAULT 3,
@@ -323,7 +323,11 @@ CREATE INDEX IF NOT EXISTS idx_client_members_user ON client_members (user_id);
 -- ============================================================
 -- This function atomically claims a due publish job using row-level locking.
 -- It uses SELECT ... FOR UPDATE SKIP LOCKED to prevent race conditions.
-CREATE OR REPLACE FUNCTION claim_publish_job(p_worker_id TEXT, p_now TIMESTAMPTZ)
+CREATE OR REPLACE FUNCTION claim_publish_job(
+  p_worker_id TEXT,
+  p_now TIMESTAMPTZ,
+  p_stale_threshold_seconds INT DEFAULT 300
+)
 RETURNS TABLE (
   id UUID,
   post_id UUID,
@@ -355,14 +359,17 @@ BEGIN
     locked_by = p_worker_id,
     started_at = p_now,
     updated_at = p_now
-  WHERE id = (
-    SELECT id
-    FROM publish_jobs
+  WHERE publish_jobs.id = (
+    SELECT pj.id
+    FROM publish_jobs pj
     WHERE
-      status IN ('SCHEDULED', 'RETRYING')
-      AND scheduled_at <= p_now
-      AND locked_at IS NULL
-      AND (next_retry_at IS NULL OR next_retry_at <= p_now)
+      (
+        (pj.status IN ('SCHEDULED', 'RETRYING') AND pj.locked_at IS NULL)
+        OR (pj.status = 'PROCESSING' AND pj.locked_at IS NOT NULL AND pj.locked_at < (p_now - (p_stale_threshold_seconds || ' seconds')::INTERVAL))
+      )
+      AND pj.scheduled_at <= p_now
+      AND (pj.next_retry_at IS NULL OR pj.next_retry_at <= p_now)
+    ORDER BY pj.scheduled_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
   )

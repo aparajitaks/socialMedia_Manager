@@ -231,6 +231,16 @@ export interface MediaAsset {
   created_at: string;
 }
 
+export type PublishJobStatus =
+  | 'SCHEDULED'
+  | 'QUEUED'
+  | 'PROCESSING'
+  | 'COMPLETED'
+  | 'PUBLISHED'
+  | 'FAILED'
+  | 'RETRYING'
+  | 'CANCELLED';
+
 export interface PublishJob {
   id: string;
   post_id: string;
@@ -239,7 +249,7 @@ export interface PublishJob {
   social_account_id: string;
   platform: PlatformType;
   scheduled_at: string;
-  status: 'SCHEDULED' | 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'RETRYING' | 'CANCELLED';
+  status: PublishJobStatus;
   idempotency_key: string;
   attempt_count: number;
   max_attempts: number;
@@ -312,6 +322,7 @@ export interface AppNotification {
     | 'POST_APPROVED'
     | 'POST_REJECTED'
     | 'POST_FAILED'
+    | 'POST_CANCELLED'
     | 'TOKEN_EXPIRED'
     | 'ACCOUNT_DISCONNECTED'
     | 'PUBLISH_SUCCESS'

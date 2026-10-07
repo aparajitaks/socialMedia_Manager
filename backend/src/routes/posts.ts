@@ -6,6 +6,32 @@ import { getPublisher } from '../publishers/index.js';
 import { validateVariant, validateVariants } from '../platform-adapter/index.js';
 import { requireAuth } from './auth.js';
 
+// ---------------------------------------------------------------------------
+// Helper: build a publish job payload for a given post + optional variant
+// ---------------------------------------------------------------------------
+function buildJobPayload(
+  post: Post,
+  variantId: string | null,
+  socialAccountId: string,
+  platform: string,
+  scheduledAt: string
+) {
+  const ts = new Date(scheduledAt).getTime();
+  const idempotencyKey = `idemp_${post.id}_${variantId || socialAccountId}_${ts}`;
+  return {
+    post_id: post.id,
+    variant_id: variantId,
+    client_id: post.client_id,
+    social_account_id: socialAccountId,
+    platform: platform as PlatformType,
+    scheduled_at: scheduledAt,
+    status: 'SCHEDULED' as const,
+    idempotency_key: idempotencyKey,
+    attempt_count: 0,
+    max_attempts: 3,
+  };
+}
+
 const router = Router();
 
 // ---------------------------------------------------------------------------
@@ -266,6 +292,22 @@ router.post('/', async (req: Request, res: Response) => {
         createdPosts.push(post);
       }
 
+      // Mode A: transactionally create publish_jobs for all scheduled posts (§5, §6)
+      if (targetStatus === 'scheduled' || targetStatus === 'SCHEDULED') {
+        const jobsPayload = createdPosts.map((p) => {
+          const scheduledAt = new Date(scheduled_at).toISOString();
+          return buildJobPayload(p, null, p.social_account_id, p.platform, scheduledAt);
+        });
+        if (jobsPayload.length > 0) {
+          try {
+            await db.createPublishJobsTransaction(jobsPayload);
+          } catch (jobErr: any) {
+            // If job creation fails, do not fail the post creation — scheduler fallback will catch
+            console.error('Mode A: failed to pre-create publish jobs:', jobErr.message);
+          }
+        }
+      }
+
       return res.status(201).json({
         post_group: postGroup,
         posts: createdPosts,
@@ -341,6 +383,27 @@ router.post('/', async (req: Request, res: Response) => {
       });
     }
 
+    // Mode B: transactionally create publish_jobs for scheduled posts (§5, §6)
+    if (targetStatus === 'scheduled' || targetStatus === 'SCHEDULED') {
+      try {
+        const scheduledAt = scheduled_at ? new Date(scheduled_at).toISOString() : new Date().toISOString();
+        let jobsPayload;
+        if (createdVariants.length > 0) {
+          // One job per variant
+          jobsPayload = createdVariants.map((v) =>
+            buildJobPayload(mainPost, v.id, v.social_account_id, v.platform, scheduledAt)
+          );
+        } else {
+          // One job for the main post itself
+          jobsPayload = [buildJobPayload(mainPost, null, mainPost.social_account_id, mainPost.platform, scheduledAt)];
+        }
+        await db.createPublishJobsTransaction(jobsPayload);
+      } catch (jobErr: any) {
+        // Non-fatal: scheduler fallback will still enqueue these
+        console.error('Mode B: failed to pre-create publish jobs:', jobErr.message);
+      }
+    }
+
     res.status(201).json({
       post: mainPost,
       variants: createdVariants,
@@ -404,6 +467,37 @@ router.patch('/:id', async (req: Request, res: Response) => {
         if (v.id) {
           await db.updatePostVariant(v.id, v);
         }
+      }
+    }
+
+    // When rescheduling: cancel any existing SCHEDULED jobs and re-create (§7, §8)
+    const newScheduledAt = scheduled_at !== undefined ? scheduled_at : currentPost.scheduled_at;
+    const newStatus = status !== undefined ? status : currentPost.status;
+    if (newScheduledAt && (newStatus === 'scheduled' || newStatus === 'SCHEDULED')) {
+      try {
+        // Cancel existing open jobs for this post
+        const existingJobs = await db.getPublishJobs({ postId: req.params.id });
+        const openJobIds = existingJobs
+          .filter((j) => j.status === 'SCHEDULED' || j.status === 'QUEUED' || j.status === 'RETRYING')
+          .map((j) => j.id);
+        for (const jobId of openJobIds) {
+          await db.cancelPublishJob(jobId);
+        }
+        // Re-create fresh jobs at new time
+        const postVariants = await db.getPostVariants(req.params.id);
+        const scheduledAt = new Date(newScheduledAt).toISOString();
+        let jobsPayload;
+        if (postVariants.length > 0) {
+          jobsPayload = postVariants.map((v) =>
+            buildJobPayload(updated, v.id, v.social_account_id, v.platform, scheduledAt)
+          );
+        } else {
+          jobsPayload = [buildJobPayload(updated, null, updated.social_account_id, updated.platform, scheduledAt)];
+        }
+        await db.createPublishJobsTransaction(jobsPayload);
+      } catch (jobErr: any) {
+        // Non-fatal: scheduler fallback handles it
+        console.warn(`PATCH /posts/${req.params.id}: publish job resync error:`, jobErr.message);
       }
     }
 
@@ -846,6 +940,52 @@ router.post('/:id/retry', async (req: Request, res: Response) => {
   }
 });
 
+// POST /api/posts/:id/cancel — Cancel a scheduled post and its pending publish jobs (§22)
+router.post('/:id/cancel', async (req: Request, res: Response) => {
+  try {
+    const post = await db.getPostById(req.params.id);
+    if (!post) return res.status(404).json({ error: 'Post not found' });
+    const tenantErr = await assertPostOwnedByOrg(post, req);
+    if (tenantErr) return res.status(tenantErr.status).json(tenantErr.body);
+
+    if (post.status === 'published') {
+      return res.status(400).json({ error: 'Cannot cancel an already published post' });
+    }
+    if (post.status === 'cancelled') {
+      return res.status(400).json({ error: 'Post is already cancelled' });
+    }
+
+    // Cancel all open publish jobs for this post
+    const callerOrgId: string | undefined = (req as any).organizationId;
+    const jobs = await db.getPublishJobs({ postId: post.id });
+    const cancellationErrors: string[] = [];
+    for (const job of jobs) {
+      if (['SCHEDULED', 'QUEUED', 'RETRYING'].includes(job.status)) {
+        try {
+          await db.cancelPublishJob(job.id, callerOrgId);
+        } catch (err: any) {
+          cancellationErrors.push(`job ${job.id}: ${err.message}`);
+        }
+      }
+    }
+
+    const updated = await db.updatePost(post.id, { status: 'cancelled' });
+
+    await db.createNotification({
+      client_id: post.client_id,
+      type: 'POST_CANCELLED',
+      title: 'Post Cancelled',
+      message: `Scheduled post was cancelled.`,
+      entity_id: post.id,
+      entity_type: 'post',
+    });
+
+    res.json({ success: true, post: updated, cancellation_errors: cancellationErrors });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // POST /api/posts/:id/reschedule — Drag-and-drop calendar rescheduling
 router.post('/:id/reschedule', async (req: Request, res: Response) => {
   try {
@@ -863,10 +1003,37 @@ router.post('/:id/reschedule', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Cannot reschedule a published post' });
     }
 
+    const newScheduledAt = new Date(scheduled_at).toISOString();
+    const newStatus: PostStatus = post.status === 'failed' || post.status === 'cancelled' ? 'scheduled' : post.status;
     const updated = await db.updatePost(post.id, {
-      scheduled_at: new Date(scheduled_at).toISOString(),
-      status: post.status === 'failed' ? 'scheduled' : post.status,
+      scheduled_at: newScheduledAt,
+      status: newStatus,
     });
+
+    // Cancel old jobs and re-create at new time (§23)
+    if (newStatus === 'scheduled') {
+      try {
+        const callerOrgId: string | undefined = (req as any).organizationId;
+        const existingJobs = await db.getPublishJobs({ postId: post.id });
+        for (const job of existingJobs) {
+          if (['SCHEDULED', 'QUEUED', 'RETRYING'].includes(job.status)) {
+            await db.cancelPublishJob(job.id, callerOrgId);
+          }
+        }
+        const postVariants = await db.getPostVariants(post.id);
+        let jobsPayload;
+        if (postVariants.length > 0) {
+          jobsPayload = postVariants.map((v) =>
+            buildJobPayload(updated, v.id, v.social_account_id, v.platform, newScheduledAt)
+          );
+        } else {
+          jobsPayload = [buildJobPayload(updated, null, updated.social_account_id, updated.platform, newScheduledAt)];
+        }
+        await db.createPublishJobsTransaction(jobsPayload);
+      } catch (jobErr: any) {
+        console.warn(`Reschedule /posts/${post.id}: job resync error:`, jobErr.message);
+      }
+    }
 
     res.json(updated);
   } catch (error: any) {

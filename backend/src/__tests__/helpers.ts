@@ -337,42 +337,129 @@ export const mockDb = {
       )
     );
   }),
+  VALID_JOB_TRANSITIONS: {
+    SCHEDULED: ['PROCESSING', 'CANCELLED', 'SCHEDULED'],
+    QUEUED: ['PROCESSING', 'CANCELLED', 'SCHEDULED'],
+    PROCESSING: ['PUBLISHED', 'COMPLETED', 'FAILED', 'RETRYING', 'SCHEDULED'],
+    RETRYING: ['PROCESSING', 'CANCELLED', 'SCHEDULED'],
+    FAILED: ['RETRYING', 'SCHEDULED', 'PROCESSING'],
+    PUBLISHED: [],
+    COMPLETED: [],
+    CANCELLED: [],
+  },
+  createPublishJobsTransaction: vi.fn((jobsData: any[]) => {
+    const existingKeys = new Set((seed.publish_jobs || []).map((j) => j.idempotency_key));
+    const created: any[] = [];
+    for (const data of jobsData) {
+      if (existingKeys.has(data.idempotency_key)) {
+        return Promise.reject(new Error(`Duplicate publish job idempotency key: '${data.idempotency_key}'`));
+      }
+      existingKeys.add(data.idempotency_key);
+      const job = {
+        id: data.id || `job-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        post_id: data.post_id,
+        variant_id: data.variant_id || null,
+        client_id: data.client_id || DEFAULT_CLIENT_ID,
+        social_account_id: data.social_account_id,
+        platform: data.platform,
+        scheduled_at: data.scheduled_at || new Date().toISOString(),
+        status: data.status || 'SCHEDULED',
+        idempotency_key: data.idempotency_key,
+        attempt_count: data.attempt_count || 0,
+        max_attempts: data.max_attempts || 3,
+        locked_at: null,
+        locked_by: null,
+        started_at: null,
+        completed_at: null,
+        next_retry_at: null,
+        last_error: null,
+        error_category: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+      created.push(job);
+    }
+    seed.publish_jobs.push(...created);
+    return Promise.resolve(created);
+  }),
+  getPublishJobs: vi.fn((filter?: any) => {
+    let jobs = [...seed.publish_jobs];
+    if (filter?.clientId) jobs = jobs.filter((j) => j.client_id === filter.clientId);
+    if (filter?.status) jobs = jobs.filter((j) => j.status === filter.status);
+    if (filter?.postId) jobs = jobs.filter((j) => j.post_id === filter.postId);
+    return Promise.resolve(jobs);
+  }),
+  cancelPublishJob: vi.fn((id: string, callerOrgId?: string) => {
+    const job = seed.publish_jobs.find((j) => j.id === id);
+    if (!job) return Promise.reject(new Error(`Publish job '${id}' not found`));
+    if (callerOrgId) {
+      const client = seed.clients.find((c) => c.id === job.client_id);
+      if (!client || client.organization_id !== callerOrgId) {
+        return Promise.reject(new Error('Unauthorized: Client does not belong to organization'));
+      }
+    }
+    if (job.status === 'PROCESSING') {
+      return Promise.reject(new Error('Cannot cancel a publish job that is currently PROCESSING by a worker'));
+    }
+    if (job.status === 'PUBLISHED' || job.status === 'COMPLETED') {
+      return Promise.reject(new Error('Cannot cancel an already published job'));
+    }
+    job.status = 'CANCELLED';
+    job.locked_at = null;
+    job.locked_by = null;
+    return Promise.resolve(job);
+  }),
+  recoverStaleJobs: vi.fn((staleThresholdMs: number = 300_000) => {
+    const now = Date.now();
+    const cutoff = now - staleThresholdMs;
+    const recoveredIds: string[] = [];
+    for (const job of seed.publish_jobs) {
+      if (job.status === 'PROCESSING' && job.locked_at && new Date(job.locked_at).getTime() < cutoff) {
+        job.status = 'RETRYING';
+        job.locked_at = null;
+        job.locked_by = null;
+        job.last_error = `Worker lock timed out after ${Math.floor(staleThresholdMs / 1000)}s - recovered by watchdog`;
+        recoveredIds.push(job.id);
+      }
+    }
+    return Promise.resolve({ recoveredCount: recoveredIds.length, recoveredIds });
+  }),
   getPublishJob: vi.fn((id: string) => Promise.resolve(seed.publish_jobs.find((j) => j.id === id) ?? null)),
   updatePublishJob: vi.fn((id: string, patch: any) => {
     const idx = seed.publish_jobs.findIndex((j) => j.id === id);
     if (idx === -1) return Promise.resolve(null);
-    seed.publish_jobs[idx] = { ...seed.publish_jobs[idx], ...patch, updated_at: new Date().toISOString() };
+    const existing = seed.publish_jobs[idx];
+    if (patch.status && patch.status !== existing.status) {
+      const allowed = (mockDb as any).VALID_JOB_TRANSITIONS[existing.status] || [];
+      if (!allowed.includes(patch.status)) {
+        return Promise.reject(new Error(`Invalid job status transition: cannot change status from '${existing.status}' to '${patch.status}'`));
+      }
+    }
+    seed.publish_jobs[idx] = { ...existing, ...patch, updated_at: new Date().toISOString() };
     return Promise.resolve(seed.publish_jobs[idx]);
   }),
-  claimPublishJob: vi.fn((workerId: string) => {
+  claimPublishJob: vi.fn((workerId: string, staleThresholdMs: number = 300_000) => {
     const now = Date.now();
-    const availableJob = seed.publish_jobs.find(
-      (j) =>
-        (j.status === 'SCHEDULED' || j.status === 'RETRYING') &&
-        !j.locked_at &&
-        new Date(j.scheduled_at).getTime() <= now &&
-        (!j.next_retry_at || new Date(j.next_retry_at).getTime() <= now)
-    );
+    const staleCutoff = now - staleThresholdMs;
+    const eligible = seed.publish_jobs
+      .filter((j) => {
+        const isDue = new Date(j.scheduled_at).getTime() <= now;
+        const retryReady = !j.next_retry_at || new Date(j.next_retry_at).getTime() <= now;
+        if (!isDue || !retryReady) return false;
+        const isFresh = (j.status === 'SCHEDULED' || j.status === 'RETRYING') && !j.locked_at;
+        const isStale = j.status === 'PROCESSING' && j.locked_at && new Date(j.locked_at).getTime() < staleCutoff;
+        return isFresh || isStale;
+      })
+      .sort((a, b) => new Date(a.scheduled_at).getTime() - new Date(b.scheduled_at).getTime());
 
-    if (!availableJob) return Promise.resolve(null);
-
-    const idx = seed.publish_jobs.findIndex((j) => j.id === availableJob.id);
-    if (idx === -1) return Promise.resolve(null);
-
-    // Double-check it's still unlocked (race condition check)
-    if (seed.publish_jobs[idx].locked_at) return Promise.resolve(null);
-
-    // Claim the job
-    seed.publish_jobs[idx] = {
-      ...seed.publish_jobs[idx],
-      status: 'PROCESSING',
-      locked_at: new Date().toISOString(),
-      locked_by: workerId,
-      started_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    };
-
-    return Promise.resolve(seed.publish_jobs[idx]);
+    if (eligible.length === 0) return Promise.resolve(null);
+    const job = eligible[0];
+    job.status = 'PROCESSING';
+    job.locked_at = new Date().toISOString();
+    job.locked_by = workerId;
+    job.started_at = new Date().toISOString();
+    job.updated_at = new Date().toISOString();
+    return Promise.resolve(job);
   }),
   getPublishJobByIdempotencyKey: vi.fn((idempotencyKey: string) => {
     const job = (seed.publish_jobs || []).find((j) => j.idempotency_key === idempotencyKey);
