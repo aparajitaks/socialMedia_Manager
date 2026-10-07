@@ -16,10 +16,15 @@ export const seed = {
     { id: 'user-admin', email: 'admin@test.com', role: 'admin', created_at: new Date().toISOString() },
     { id: 'user-editor', email: 'editor@test.com', role: 'editor', created_at: new Date().toISOString() },
   ],
+  organizations: [] as any[],
+  clients: [] as any[],
   social_accounts: [] as any[],
   post_groups: [] as any[],
   posts: [] as any[],
   post_metrics: [] as any[],
+  publish_jobs: [] as any[],
+  publish_attempts: [] as any[],
+  post_variants: [] as any[],
 };
 
 /**
@@ -29,6 +34,7 @@ export function resetSeed() {
   seed.social_accounts = [
     {
       id: 'acc-li',
+      client_id: DEFAULT_CLIENT_ID,
       platform: 'linkedin',
       display_name: 'Test LinkedIn Page',
       access_token: 'enc:mock_token_li',
@@ -36,9 +42,11 @@ export function resetSeed() {
       external_account_id: 'li_ext_123',
       token_expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
       connected_at: new Date().toISOString(),
+      status: 'connected',
     },
     {
       id: 'acc-x',
+      client_id: DEFAULT_CLIENT_ID,
       platform: 'x',
       display_name: 'Test X Account',
       access_token: 'enc:mock_token_x',
@@ -46,6 +54,7 @@ export function resetSeed() {
       external_account_id: 'x_ext_456',
       token_expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
       connected_at: new Date().toISOString(),
+      status: 'connected',
     },
   ];
   seed.post_groups = [
@@ -54,6 +63,7 @@ export function resetSeed() {
   seed.posts = [
     {
       id: 'post-draft',
+      client_id: DEFAULT_CLIENT_ID,
       post_group_id: 'grp-1',
       social_account_id: 'acc-li',
       platform: 'linkedin',
@@ -70,6 +80,7 @@ export function resetSeed() {
     },
     {
       id: 'post-scheduled',
+      client_id: DEFAULT_CLIENT_ID,
       post_group_id: 'grp-1',
       social_account_id: 'acc-li',
       platform: 'linkedin',
@@ -86,6 +97,7 @@ export function resetSeed() {
     },
     {
       id: 'post-published',
+      client_id: DEFAULT_CLIENT_ID,
       post_group_id: 'grp-1',
       social_account_id: 'acc-li',
       platform: 'linkedin',
@@ -102,6 +114,7 @@ export function resetSeed() {
     },
     {
       id: 'post-failed',
+      client_id: DEFAULT_CLIENT_ID,
       post_group_id: 'grp-1',
       social_account_id: 'acc-x',
       platform: 'x',
@@ -128,14 +141,63 @@ export function resetSeed() {
       fetched_at: new Date().toISOString(),
     },
   ];
+  seed.publish_jobs = [];
+  seed.publish_attempts = [];
+  seed.post_variants = [];
+  seed.organizations = [
+    { id: DEFAULT_ORG_ID, name: 'Test Org', created_at: new Date().toISOString() },
+  ];
+  seed.clients = [
+    { id: DEFAULT_CLIENT_ID, organization_id: DEFAULT_ORG_ID, name: 'Default Test Client', timezone: 'UTC', created_at: new Date().toISOString() },
+    { id: '00000000-0000-0000-0000-000000000020', organization_id: DEFAULT_ORG_ID, name: 'Second Test Client', timezone: 'UTC', created_at: new Date().toISOString() },
+  ];
 }
+
+process.env.LINKEDIN_CLIENT_ID = process.env.LINKEDIN_CLIENT_ID || 'test-linkedin-client-id';
+process.env.LINKEDIN_CLIENT_SECRET = process.env.LINKEDIN_CLIENT_SECRET || 'test-linkedin-secret';
+process.env.META_APP_ID = process.env.META_APP_ID || '123456789012345';
+process.env.META_APP_SECRET = process.env.META_APP_SECRET || 'test-meta-secret';
+
+export const DEFAULT_CLIENT_ID = '00000000-0000-0000-0000-000000000010';
+export const DEFAULT_ORG_ID = '00000000-0000-0000-0000-000000000001';
 
 // ── DB mock implementation ───────────────────────────────────────────────────
 export const mockDb = {
+  // Client + organization helpers
+  getClient: vi.fn((id: string) => {
+    const c = (seed.clients || []).find((x: any) => x.id === id);
+    if (c) return Promise.resolve(c);
+    if (id === DEFAULT_CLIENT_ID) {
+      return Promise.resolve({ id: DEFAULT_CLIENT_ID, organization_id: DEFAULT_ORG_ID, name: 'Default Test Client', timezone: 'UTC' });
+    }
+    return Promise.resolve(null as any);
+  }),
+  getClients: vi.fn((orgId?: string) => {
+    let list = seed.clients || [];
+    if (orgId) list = list.filter((c: any) => c.organization_id === orgId);
+    return Promise.resolve([...list]);
+  }),
+  createClient: vi.fn((data: any) => {
+    const c = { id: data.id || `client-${Date.now()}`, organization_id: data.organization_id || DEFAULT_ORG_ID, ...data };
+    if (!seed.clients) seed.clients = [];
+    seed.clients.push(c);
+    return Promise.resolve(c);
+  }),
   getUsers: vi.fn(() => Promise.resolve([...seed.users])),
   getUserById: vi.fn((id: string) => Promise.resolve(seed.users.find((u) => u.id === id) ?? null)),
   getSocialAccounts: vi.fn(() => Promise.resolve([...seed.social_accounts])),
+  getSocialAccount: vi.fn((id: string) => Promise.resolve(seed.social_accounts.find((a) => a.id === id) ?? null)),
   getSocialAccountById: vi.fn((id: string) => Promise.resolve(seed.social_accounts.find((a) => a.id === id) ?? null)),
+  upsertSocialAccount: vi.fn((data: any) => {
+    const existingIdx = seed.social_accounts.findIndex((a) => a.id === data.id);
+    if (existingIdx >= 0) {
+      seed.social_accounts[existingIdx] = { ...seed.social_accounts[existingIdx], ...data };
+      return Promise.resolve(seed.social_accounts[existingIdx]);
+    }
+    const acc = { ...data, id: data.id || `acc-new-${Date.now()}`, connected_at: new Date().toISOString() };
+    seed.social_accounts.push(acc);
+    return Promise.resolve(acc);
+  }),
   createSocialAccount: vi.fn((data: any) => {
     const acc = { ...data, id: `acc-new-${Date.now()}`, connected_at: new Date().toISOString() };
     seed.social_accounts.push(acc);
@@ -164,8 +226,13 @@ export const mockDb = {
     return Promise.resolve(posts);
   }),
   getPostById: vi.fn((id: string) => Promise.resolve(seed.posts.find((p) => p.id === id) ?? null)),
+  getPost: vi.fn((id: string) => Promise.resolve(seed.posts.find((p) => p.id === id) ?? null)),
   createPost: vi.fn((data: any) => {
-    const post = { ...data, id: `post-${Date.now()}`, created_at: new Date().toISOString() };
+    const post = {
+      ...data,
+      id: data.id || `post-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      created_at: new Date().toISOString(),
+    };
     seed.posts.push(post);
     return Promise.resolve(post);
   }),
@@ -198,10 +265,132 @@ export const mockDb = {
       { platform: 'linkedin', total_likes: 42, total_comments: 7, total_shares: 3, total_impressions: 820 },
     ])
   ),
+  getPostVariants: vi.fn((postId: string) =>
+    Promise.resolve((seed.post_variants || []).filter((v: any) => v.post_id === postId))
+  ),
+  getPostVariantById: vi.fn((id: string) => {
+    const v = (seed.post_variants || []).find((x: any) => x.id === id);
+    return Promise.resolve(v || null);
+  }),
+  createPostVariant: vi.fn((v: any) => {
+    const created = {
+      id: v.id || `var-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      ...v,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    if (!seed.post_variants) seed.post_variants = [];
+    seed.post_variants.push(created);
+    return Promise.resolve(created);
+  }),
+  updatePostVariant: vi.fn((id: string, patch: any) => {
+    const idx = (seed.post_variants || []).findIndex((v: any) => v.id === id);
+    if (idx !== -1) {
+      seed.post_variants[idx] = { ...seed.post_variants[idx], ...patch, updated_at: new Date().toISOString() };
+      return Promise.resolve(seed.post_variants[idx]);
+    }
+    return Promise.resolve({ id, ...patch });
+  }),
+  deletePostVariant: vi.fn((id: string) => {
+    seed.post_variants = (seed.post_variants || []).filter((v: any) => v.id !== id);
+    return Promise.resolve();
+  }),
+  getApprovals: vi.fn(() => Promise.resolve([])),
+  createApproval: vi.fn((a: any) => Promise.resolve({ id: `appr-${Date.now()}`, ...a })),
+  updateApproval: vi.fn((id: string, a: any) => Promise.resolve({ id, ...a })),
+  createNotification: vi.fn((n: any) => Promise.resolve({ id: `notif-${Date.now()}`, ...n })),
+  saveOAuthState: vi.fn((s: any) => Promise.resolve(s)),
+  getOAuthState: vi.fn((state: string) => Promise.resolve({ state, client_id: DEFAULT_CLIENT_ID, platform: 'linkedin', expires_at: new Date(Date.now() + 60000).toISOString(), return_to: null })),
+  deleteOAuthState: vi.fn(() => Promise.resolve()),
+  getMembershipByUserId: vi.fn(() => Promise.resolve(null)),
+  getUserByEmail: vi.fn((email: string) => Promise.resolve(seed.users.find((u) => u.email === email) ?? null)),
+  // Publish jobs
+  createPublishJob: vi.fn((data: any) => {
+    const job = {
+      ...data,
+      id: data.id || `job-${Date.now()}`,
+      status: data.status || 'SCHEDULED',
+      attempt_count: data.attempt_count || 0,
+      max_attempts: data.max_attempts || 3,
+      locked_at: null,
+      locked_by: null,
+      started_at: null,
+      completed_at: null,
+      next_retry_at: null,
+      last_error: null,
+      error_category: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    seed.publish_jobs.push(job);
+    return Promise.resolve(job);
+  }),
+  getDuePublishJobs: vi.fn(() => {
+    const now = Date.now();
+    return Promise.resolve(
+      seed.publish_jobs.filter(
+        (j) =>
+          (j.status === 'SCHEDULED' || j.status === 'RETRYING') &&
+          !j.locked_at &&
+          new Date(j.scheduled_at).getTime() <= now &&
+          (!j.next_retry_at || new Date(j.next_retry_at).getTime() <= now)
+      )
+    );
+  }),
+  getPublishJob: vi.fn((id: string) => Promise.resolve(seed.publish_jobs.find((j) => j.id === id) ?? null)),
+  updatePublishJob: vi.fn((id: string, patch: any) => {
+    const idx = seed.publish_jobs.findIndex((j) => j.id === id);
+    if (idx === -1) return Promise.resolve(null);
+    seed.publish_jobs[idx] = { ...seed.publish_jobs[idx], ...patch, updated_at: new Date().toISOString() };
+    return Promise.resolve(seed.publish_jobs[idx]);
+  }),
+  claimPublishJob: vi.fn((workerId: string) => {
+    const now = Date.now();
+    const availableJob = seed.publish_jobs.find(
+      (j) =>
+        (j.status === 'SCHEDULED' || j.status === 'RETRYING') &&
+        !j.locked_at &&
+        new Date(j.scheduled_at).getTime() <= now &&
+        (!j.next_retry_at || new Date(j.next_retry_at).getTime() <= now)
+    );
+
+    if (!availableJob) return Promise.resolve(null);
+
+    const idx = seed.publish_jobs.findIndex((j) => j.id === availableJob.id);
+    if (idx === -1) return Promise.resolve(null);
+
+    // Double-check it's still unlocked (race condition check)
+    if (seed.publish_jobs[idx].locked_at) return Promise.resolve(null);
+
+    // Claim the job
+    seed.publish_jobs[idx] = {
+      ...seed.publish_jobs[idx],
+      status: 'PROCESSING',
+      locked_at: new Date().toISOString(),
+      locked_by: workerId,
+      started_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    return Promise.resolve(seed.publish_jobs[idx]);
+  }),
+  getPublishJobByIdempotencyKey: vi.fn((idempotencyKey: string) => {
+    const job = (seed.publish_jobs || []).find((j) => j.idempotency_key === idempotencyKey);
+    return Promise.resolve(job || null);
+  }),
+  createPublishAttempt: vi.fn((data: any) => {
+    const attempt = {
+      ...data,
+      id: `attempt-${Date.now()}`,
+      executed_at: new Date().toISOString(),
+    };
+    seed.publish_attempts.push(attempt);
+    return Promise.resolve(attempt);
+  }),
 };
 
 // ── Mock the db module before routes are imported ────────────────────────────
-vi.mock('../db.js', () => ({ db: mockDb, supabase: null }));
+vi.mock('../db.js', () => ({ db: mockDb, supabase: null, DEFAULT_CLIENT_ID, DEFAULT_ORG_ID }));
 
 // ── Mock the publishers so tests never hit real APIs ─────────────────────────
 export const mockPublisher = {
@@ -214,9 +403,19 @@ export const mockPublisher = {
   fetchMetrics: vi.fn().mockResolvedValue({ likes: 10, comments: 2, shares: 1, impressions: 200 }),
 };
 
-vi.mock('../publishers/index.js', () => ({
-  getPublisher: vi.fn(() => mockPublisher),
-}));
+vi.mock('../publishers/index.js', async (importOriginal) => {
+  const actual = await importOriginal<any>();
+  return {
+    ...actual,
+    getPublisher: vi.fn(() => mockPublisher),
+    exchangeLinkedInCode: vi.fn(async () => ({ access_token: 'mock_linkedin_access', refresh_token: 'mock_linkedin_refresh', expires_in: 3600 })),
+    discoverLinkedInOrganizations: vi.fn(async () => ([{ id: 'urn:li:organization:98214', name: 'Apex Digital Systems' }])),
+    exchangeGoogleCode: vi.fn(async () => ({ access_token: 'mock_google_access', refresh_token: 'mock_google_refresh', expires_in: 3600 })),
+    discoverGoogleLocations: vi.fn(async () => ([{ id: 'accounts/109283749281/locations/48192049281', name: 'Downtown Flagship Store' }])),
+    exchangeMetaCode: vi.fn(async () => ({ access_token: 'mock_meta_access', expires_in: 3600 })),
+    discoverMetaPagesAndInstagram: vi.fn(async () => ([{ id: 'fb_page_109283741', name: 'Apex Growth Page' }])),
+  };
+});
 
 // ── Mock crypto so token values are predictable ───────────────────────────────
 vi.mock('../crypto.js', () => ({
@@ -228,11 +427,26 @@ vi.mock('../crypto.js', () => ({
 export async function buildApp(): Promise<Express> {
   const app = express();
   app.use(cors());
-  app.use(express.json());
+  app.use(express.json({
+    verify: (req: any, _res, buf) => {
+      req.rawBody = buf;
+    },
+  }));
   app.get('/api/health', (_, res) => res.json({ status: 'ok' }));
 
-  const [accountsRouter, postsRouter, metricsRouter, schedulerRouter, cronRouter, authRouter] = await Promise.all([
+  const [
+    { initializeAdapters },
+    accountsRouter,
+    socialAccountsRouter,
+    postsRouter,
+    metricsRouter,
+    schedulerRouter,
+    cronRouter,
+    authRouter,
+  ] = await Promise.all([
+    import('../platform-adapter/adapters/index.js'),
     import('../routes/accounts.js').then((m) => m.default),
+    import('../routes/social-accounts.js').then((m) => m.default),
     import('../routes/posts.js').then((m) => m.default),
     import('../routes/metrics.js').then((m) => m.default),
     import('../routes/scheduler.js').then((m) => m.default),
@@ -240,7 +454,10 @@ export async function buildApp(): Promise<Express> {
     import('../routes/auth.js').then((m) => m.default),
   ]);
 
+  initializeAdapters();
+
   app.use('/api/accounts', accountsRouter);
+  app.use('/api/social-accounts', socialAccountsRouter);
   app.use('/api/posts', postsRouter);
   app.use('/api/metrics', metricsRouter);
   app.use('/api/scheduler', schedulerRouter);

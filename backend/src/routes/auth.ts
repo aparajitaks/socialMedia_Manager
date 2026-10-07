@@ -1,6 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { createClient } from '@supabase/supabase-js';
-import { db } from '../db.js';
+import { db, DEFAULT_ORG_ID } from '../db.js';
 import { UserRole } from '../types/index.js';
 
 const router = Router();
@@ -9,7 +9,8 @@ const router = Router();
 // Supabase Auth client (uses anon key for client-facing auth operations)
 // ---------------------------------------------------------------------------
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+const supabaseAnonKey =
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 const supabaseAuth = (supabaseUrl && supabaseAnonKey)
@@ -24,10 +25,19 @@ const supabaseAdmin = (supabaseUrl && supabaseServiceKey)
 // Middleware: verify Supabase JWT (attach user to req)
 // ---------------------------------------------------------------------------
 export async function requireAuth(req: Request, res: Response, next: NextFunction) {
-  // Zero-config mode: no Supabase credentials → skip auth
+  // In production, real authentication configuration is strictly required
+  if (process.env.NODE_ENV === 'production' && !supabaseAuth) {
+    return res.status(500).json({ error: 'Server authentication is unconfigured in production environment.' });
+  }
+
+  // Zero-config dev/test mode: no Supabase credentials configured
   if (!supabaseAuth) {
-    (req as any).userId = null;
-    (req as any).userRole = (req.headers['x-user-role'] as UserRole) || 'admin';
+    (req as any).userId = (req as any).userId || '00000000-0000-0000-0000-000000000002'; // Default admin user
+    (req as any).userRole = (process.env.NODE_ENV === 'production')
+      ? 'viewer'
+      : ((req as any).userRole || (req.headers['x-user-role'] as UserRole) || 'admin');
+    // In zero-config mode, preserve pre-assigned org or header, falling back to default seed organization
+    (req as any).organizationId = (req as any).organizationId || (req.headers['x-organization-id'] as string) || DEFAULT_ORG_ID;
     return next();
   }
 
@@ -46,6 +56,25 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
 
   (req as any).authUser = user;
   (req as any).userId = user.id;
+
+  // Resolve user role securely from verified database or JWT metadata
+  const dbUser = await db.getUserByEmail(user.email || '');
+  (req as any).userRole = (dbUser?.role || user.user_metadata?.role || 'editor') as UserRole;
+
+  // Resolve which organization (workspace) this user belongs to.
+  // Prefer the users table's organization_id, fall back to workspace_members lookup.
+  if (dbUser?.organization_id) {
+    (req as any).organizationId = dbUser.organization_id;
+  } else {
+    const membership = await db.getMembershipByUserId(user.id);
+    (req as any).organizationId = membership?.workspace_id ?? null;
+  }
+
+  if (!(req as any).organizationId) {
+    // The JWT is valid but the user has no workspace — refuse access
+    return res.status(403).json({ error: 'User is not a member of any workspace' });
+  }
+
   next();
 }
 
@@ -197,7 +226,12 @@ router.get('/me', async (req: Request, res: Response) => {
       }
     }
 
-    // Zero-config fallback: use x-user-role header
+    // In production, reject unauthenticated /me requests; zero-config fallback is test/dev only
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(401).json({ error: 'Unauthorized: active session required' });
+    }
+
+    // Zero-config fallback: use x-user-role header (dev/test only)
     const role = (req.headers['x-user-role'] as UserRole) || 'admin';
     const users = await db.getUsers();
     const user = users.find((u) => u.role === role) || users[0];

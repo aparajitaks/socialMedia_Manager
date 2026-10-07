@@ -2,7 +2,7 @@
 
 import { PLATFORM_COLORS, PLATFORM_LABELS, type Platform } from '@/lib/api';
 
-type NavSection = 'calendar' | 'status' | 'analytics' | 'accounts';
+export type NavSection = 'calendar' | 'status' | 'library' | 'bulk' | 'reports' | 'inbox' | 'analytics' | 'accounts' | 'clients' | 'settings';
 
 interface Props {
   section: NavSection;
@@ -12,13 +12,21 @@ interface Props {
   setRole: (r: 'admin' | 'editor') => void;
   onRunScheduler: () => void;
   schedulerRunning: boolean;
+  unreadNotifications?: number;
+  onOpenNotifications?: () => void;
 }
 
-const NAV: { id: NavSection; label: string }[] = [
-  { id: 'calendar', label: 'Calendar' },
-  { id: 'status', label: 'Status' },
-  { id: 'analytics', label: 'Analytics' },
-  { id: 'accounts', label: 'Accounts' },
+const NAV: { id: NavSection; label: string; icon: string }[] = [
+  { id: 'calendar', label: 'Calendar', icon: '📅' },
+  { id: 'status', label: 'Status & Approvals', icon: '📋' },
+  { id: 'library', label: 'Content Library', icon: '🔄' },
+  { id: 'bulk', label: 'Bulk Scheduler', icon: '⚡' },
+  { id: 'reports', label: 'Client Reports', icon: '📊' },
+  { id: 'inbox', label: 'Social Inbox', icon: '💬' },
+  { id: 'analytics', label: 'Analytics', icon: '📈' },
+  { id: 'accounts', label: 'Accounts', icon: '🔗' },
+  { id: 'clients', label: 'Clients', icon: '🏢' },
+  { id: 'settings', label: 'Settings & API Keys', icon: '⚙️' },
 ];
 
 export default function Sidebar({
@@ -29,6 +37,8 @@ export default function Sidebar({
   setRole,
   onRunScheduler,
   schedulerRunning,
+  unreadNotifications = 0,
+  onOpenNotifications,
 }: Props) {
   return (
     <aside
@@ -43,22 +53,24 @@ export default function Sidebar({
       </div>
 
       {/* Nav */}
-      <nav className="flex-1 py-3">
-        {NAV.map(({ id, label }) => {
+      <nav className="flex-1 py-3 overflow-y-auto space-y-0.5">
+        {NAV.map(({ id, label, icon }) => {
           const active = section === id;
           return (
             <button
               key={id}
               id={`sidebar-nav-${id}`}
               onClick={() => setSection(id)}
-              className="w-full text-left px-5 py-2 text-sm transition-colors"
+              className="w-full text-left px-4 py-2 text-xs flex items-center gap-2.5 transition-colors rounded-md mx-auto"
               style={{
                 color: active ? '#2B6E63' : '#1C2321',
                 background: active ? '#EBF3F1' : 'transparent',
-                fontWeight: active ? 500 : 400,
+                fontWeight: active ? 600 : 400,
+                width: 'calc(100% - 16px)',
               }}
             >
-              {label}
+              <span className="text-sm shrink-0">{icon}</span>
+              <span className="truncate">{label}</span>
             </button>
           );
         })}
@@ -136,18 +148,36 @@ export default function Sidebar({
         </button>
       </div>
 
-      {/* Team */}
+      {/* Team + Notifications */}
       <div className="px-5 py-4 border-t" style={{ borderColor: '#D8DAD5' }}>
-        <div className="flex items-center gap-2">
-          <div
-            className="w-6 h-6 rounded-full flex items-center justify-center text-xs font-medium"
-            style={{ background: '#D8DAD5', color: '#1C2321' }}
-          >
-            MK
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div
+              className="w-6 h-6 rounded-full flex items-center justify-center text-xs font-medium"
+              style={{ background: '#D8DAD5', color: '#1C2321' }}
+            >
+              MK
+            </div>
+            <span className="text-xs" style={{ color: '#9A9A93' }}>
+              Marketing team
+            </span>
           </div>
-          <span className="text-xs" style={{ color: '#9A9A93' }}>
-            Marketing team
-          </span>
+          <button
+            id="sidebar-notifications-btn"
+            onClick={onOpenNotifications}
+            className="relative p-1 rounded transition-colors hover:bg-white"
+            title="Notifications"
+          >
+            <span style={{ fontSize: 14 }}>🔔</span>
+            {unreadNotifications > 0 && (
+              <span
+                className="absolute -top-0.5 -right-0.5 w-3.5 h-3.5 rounded-full flex items-center justify-center text-white"
+                style={{ background: '#B34A3C', fontSize: 8, fontWeight: 600 }}
+              >
+                {unreadNotifications > 9 ? '9+' : unreadNotifications}
+              </span>
+            )}
+          </button>
         </div>
       </div>
     </aside>

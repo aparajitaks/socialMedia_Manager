@@ -1,8 +1,9 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;450;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700;800&family=Inter:wght@400;450;500;600;700&display=swap');
 @import 'tailwindcss';
 
 :root {
   --font-sans: 'Inter', system-ui, sans-serif;
+  --font-display: 'Fraunces', Georgia, serif;
   --color-paper: #F4F5F2;
   --color-ink: #1C2321;
   --color-teal: #2B6E63;
@@ -23,7 +24,7 @@ html, body {
 }
 
 body {
-  font-family: 'Inter', system-ui, sans-serif;
+  font-family: var(--font-sans);
   background: #F4F5F2;
   color: #1C2321;
   -webkit-font-smoothing: antialiased;

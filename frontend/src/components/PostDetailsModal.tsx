@@ -14,6 +14,15 @@ import {
 } from '@/lib/api';
 import PlatformLogo from './PlatformLogo';
 
+async function submitForApproval(postId: string): Promise<{ shareable_review_url: string }> {
+  const res = await fetch(`/api/posts/${postId}/submit-approval`, { method: 'POST' });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || 'Failed to submit for approval');
+  }
+  return res.json();
+}
+
 interface PostDetailsModalProps {
   post: Post | null;
   accounts: SocialAccount[];
@@ -37,6 +46,7 @@ export function PostDetailsModal({
   const [editedSchedule, setEditedSchedule] = useState('');
   const [isSaving, setIsSaving] = useState(false);
   const [isActing, setIsActing] = useState(false);
+  const [reviewUrl, setReviewUrl] = useState<string | null>(null);
 
   useEffect(() => {
     if (post) {
@@ -51,6 +61,7 @@ export function PostDetailsModal({
         setEditedSchedule('');
       }
       setIsEditing(false);
+      setReviewUrl(null);
 
       if (post.status === 'published') {
         fetchPostMetrics(post.id)
@@ -118,6 +129,20 @@ export function PostDetailsModal({
       showToast('Post approved');
       onPostUpdated();
       onClose();
+    } catch (err: any) {
+      showToast(err.message, 'error');
+    } finally {
+      setIsActing(false);
+    }
+  };
+
+  const handleSubmitApproval = async () => {
+    setIsActing(true);
+    try {
+      const result = await submitForApproval(post.id);
+      showToast('Post submitted for approval — share link generated!');
+      setReviewUrl(result.shareable_review_url);
+      onPostUpdated();
     } catch (err: any) {
       showToast(err.message, 'error');
     } finally {
@@ -331,10 +356,20 @@ export function PostDetailsModal({
 
         {/* Footer */}
         <div
-          className="flex items-center justify-between px-5 py-3 border-t shrink-0"
+          className="flex items-center justify-between px-5 py-3 border-t shrink-0 gap-2"
           style={{ borderColor: '#D8DAD5' }}
         >
-          <div>
+          <div className="flex items-center gap-2 flex-wrap">
+            {post.status === 'draft' && (
+              <button
+                onClick={handleSubmitApproval}
+                disabled={isActing}
+                className="px-3 py-1.5 text-xs border rounded transition-colors hover:bg-white"
+                style={{ borderColor: '#C07B3A', color: '#C07B3A' }}
+              >
+                {isActing ? '…' : 'Submit for approval'}
+              </button>
+            )}
             {!post.approved_by && post.status !== 'published' && (
               <button
                 onClick={handleApprove}
@@ -350,15 +385,22 @@ export function PostDetailsModal({
               </button>
             )}
             {post.approved_by && (
-              <span className="text-xs font-medium" style={{ color: '#2B6E63' }}>
-                ✓ Approved
-              </span>
+              <span className="text-xs font-medium" style={{ color: '#2B6E63' }}>✓ Approved</span>
+            )}
+            {reviewUrl && (
+              <button
+                onClick={() => { navigator.clipboard?.writeText(reviewUrl); showToast('Review link copied!'); }}
+                className="px-3 py-1.5 text-xs border rounded transition-colors hover:bg-white"
+                style={{ borderColor: '#2B6E63', color: '#2B6E63' }}
+              >
+                🔗 Copy review link
+              </button>
             )}
           </div>
 
           <button
             onClick={onClose}
-            className="px-3 py-1.5 text-xs border rounded transition-colors hover:bg-white"
+            className="px-3 py-1.5 text-xs border rounded transition-colors hover:bg-white shrink-0"
             style={{ borderColor: '#D8DAD5', color: '#1C2321' }}
           >
             Close

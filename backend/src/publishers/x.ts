@@ -1,65 +1,79 @@
 import { Post, SocialAccount } from '../types/index.js';
-import { decryptToken, encryptToken } from '../crypto.js';
+import { decryptToken } from '../crypto.js';
 import { SocialPublisher, PublishResult, RefreshResult, MetricResult } from './types.js';
+import {
+  requireLiveCredentials,
+  requireRealAccessToken,
+  sandboxFailureHook,
+  AccountNeedsReconnectError,
+  MetricsNotAvailableError,
+  isSandboxMode,
+  isSandboxAccessToken,
+} from './credentials.js';
 
 export class XPublisher implements SocialPublisher {
   async publish(post: Post, account: SocialAccount): Promise<PublishResult> {
-    const rawToken = decryptToken(account.access_token || account.access_token_encrypted);
+    // Gate first: never fall through to a fabricated tweet id.
+    requireLiveCredentials('X', ['X_API_KEY', 'X_API_SECRET']);
+    const rawToken = requireRealAccessToken('X', decryptToken(account.access_token || account.access_token_encrypted || ''));
 
-    if (rawToken === 'invalid_token' || rawToken.startsWith('bad_token')) {
-      throw new Error('X API 401: Unauthorized access token');
-    }
+    sandboxFailureHook(rawToken === 'invalid_token' || rawToken.startsWith('bad_token'), 'X API 401: Unauthorized access token');
+    sandboxFailureHook(post.content.includes('[TRIGGER_FAIL]'), 'X API 403 Forbidden: Duplicate tweet content or character limit exceeded');
 
-    if (post.content.includes('[TRIGGER_FAIL]')) {
-      throw new Error('X API 403 Forbidden: Duplicate tweet content or character limit exceeded');
-    }
+    try {
+      const res = await fetch('https://api.twitter.com/2/tweets', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${rawToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ text: post.content })
+      });
 
-    if (process.env.X_API_KEY && !rawToken.startsWith('mock_')) {
-      try {
-        const res = await fetch('https://api.twitter.com/2/tweets', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${rawToken}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({ text: post.content })
-        });
-
-        if (!res.ok) {
-          const err = await res.text();
-          throw new Error(`X API Error (${res.status}): ${err}`);
-        }
-
-        const data = await res.json();
-        const id = data.data?.id || `x_${Date.now()}`;
-        return { success: true, externalPostId: id, platform_post_id: id };
-      } catch (err: any) {
-        throw new Error(err.message || 'X publish failed');
+      if (!res.ok) {
+        const err = await res.text();
+        throw new Error(`X API Error (${res.status}): ${err}`);
       }
-    }
 
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    const generatedId = `x_tweet_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-    return {
-      success: true,
-      externalPostId: generatedId,
-      platform_post_id: generatedId,
-    };
+      const data = await res.json();
+      const id = data.data?.id;
+      if (!id) {
+        throw new Error(`X API returned no tweet id: ${JSON.stringify(data)}`);
+      }
+      return { success: true, externalPostId: id, platform_post_id: id };
+    } catch (err: any) {
+      throw new Error(err.message || 'X publish failed');
+    }
   }
 
   async refreshToken(account: SocialAccount): Promise<RefreshResult> {
-    return {
-      access_token: encryptToken(`mock_x_${Date.now()}`),
-      token_expires_at: new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString()
-    };
+    requireLiveCredentials('X', ['X_API_KEY', 'X_API_SECRET']);
+    const rawRefreshToken = account.refresh_token || account.refresh_token_encrypted
+      ? decryptToken((account.refresh_token || account.refresh_token_encrypted) as string)
+      : null;
+
+    if (!rawRefreshToken || isSandboxAccessToken(rawRefreshToken)) {
+      throw new AccountNeedsReconnectError('X');
+    }
+
+    // X token refresh needs the OAuth2 client id, which this build does not
+    // configure. Say so instead of minting a token that would look valid.
+    throw new Error(
+      `X token refresh is not implemented in this build (account ${account.id}). ` +
+        `Reconnect the account to obtain a fresh access token.`
+    );
   }
 
   async fetchMetrics(post: Post, account: SocialAccount): Promise<MetricResult> {
-    const impressions = Math.floor(500 + Math.random() * 400);
-    const likes = Math.floor(impressions * 0.03 + Math.random() * 10);
-    const comments = Math.floor(likes * 0.2 + Math.random() * 3);
-    const shares = Math.floor(likes * 0.35 + Math.random() * 4); // Retweets
+    if (isSandboxMode()) {
+      const impressions = Math.floor(200 + Math.random() * 300);
+      const likes = Math.floor(impressions * 0.04);
+      console.warn(`⚠️ SANDBOX_MODE: invented X engagement for post ${post?.id} — these are not real metrics`);
+      return { likes, comments: Math.floor(likes * 0.2), shares: Math.floor(likes * 0.1), impressions };
+    }
 
-    return { likes, comments, shares, impressions };
+    // No engagement-reading integration exists yet. Refuse rather than invent
+    // impressions/likes, which would show up as real performance in reports.
+    throw new MetricsNotAvailableError('X');
   }
 }

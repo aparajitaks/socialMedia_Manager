@@ -2,8 +2,8 @@ import type { Metadata, Viewport } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'Postline | Internal Social Media Scheduler',
-  description: 'Internal multi-channel social media scheduler, queue manager, and live performance analytics for LinkedIn, Meta, Google Business, and X.',
+  title: 'Postline | Social Publishing for Agencies',
+  description: 'An original multi-client social publishing platform for agencies managing calendars, approvals, inbox, analytics, and content libraries.',
 };
 
 export const viewport: Viewport = {

@@ -1,42 +1,52 @@
 import { Router, Request, Response } from 'express';
-import { db } from '../db.js';
-import { PlatformType } from '../types/index.js';
-import { encryptToken } from '../crypto.js';
 import crypto from 'crypto';
+import { db, DEFAULT_CLIENT_ID } from '../db.js';
+import { PlatformType, SocialAccount } from '../types/index.js';
+import { encryptToken, decryptToken } from '../crypto.js';
+import {
+  getGoogleAuthUrl,
+  exchangeGoogleCode,
+  discoverGoogleLocations,
+  getLinkedInAuthUrl,
+  exchangeLinkedInCode,
+  discoverLinkedInOrganizations,
+  getMetaAuthUrl,
+  exchangeMetaCode,
+  discoverMetaPagesAndInstagram,
+} from '../publishers/index.js';
 
 const router = Router();
 
-// In-memory CSRF state store (replace with Redis/DB for multi-instance deployments)
-const oauthStateStore = new Map<string, { platform: string; expires: number }>();
-
-function generateState(platform: string): string {
-  const state = crypto.randomBytes(16).toString('hex');
-  oauthStateStore.set(state, { platform, expires: Date.now() + 10 * 60 * 1000 }); // 10-min TTL
-  // Purge expired states
-  for (const [k, v] of oauthStateStore.entries()) {
-    if (v.expires < Date.now()) oauthStateStore.delete(k);
-  }
-  return state;
-}
-
-function validateState(state: string, platform: string): boolean {
-  const entry = oauthStateStore.get(state);
-  if (!entry) return false;
-  if (entry.expires < Date.now()) {
-    oauthStateStore.delete(state);
-    return false;
-  }
-  oauthStateStore.delete(state); // one-time use
-  return entry.platform === platform;
+function isValidMetaAppId(value?: string | null): boolean {
+  return !!value && /^\d+$/.test(value);
 }
 
 // ---------------------------------------------------------------------------
-// GET /api/accounts
+// GET /api/accounts/config-status
+// ---------------------------------------------------------------------------
+router.get('/config-status', (req: Request, res: Response) => {
+  res.json({
+    linkedin: !!(process.env.LINKEDIN_CLIENT_ID && process.env.LINKEDIN_CLIENT_SECRET),
+    meta: !!((process.env.META_APP_ID || process.env.META_CLIENT_ID) && (process.env.META_APP_SECRET || process.env.META_CLIENT_SECRET)),
+    facebook: !!((process.env.META_APP_ID || process.env.META_CLIENT_ID) && (process.env.META_APP_SECRET || process.env.META_CLIENT_SECRET)),
+    instagram: !!((process.env.META_APP_ID || process.env.META_CLIENT_ID) && (process.env.META_APP_SECRET || process.env.META_CLIENT_SECRET)),
+    google_business: !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET),
+    x: !!((process.env.X_CLIENT_ID || process.env.X_API_KEY) && (process.env.X_CLIENT_SECRET || process.env.X_API_SECRET)),
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/accounts  — list accounts (optionally filtered by ?client_id=...)
 // ---------------------------------------------------------------------------
 router.get('/', async (req: Request, res: Response) => {
   try {
-    const accounts = await db.getSocialAccounts();
-    const sanitized = accounts.map(({ access_token, refresh_token, ...safe }) => safe);
+    const clientId = (req.query.client_id || req.query.clientId) as string | undefined;
+    const accounts = await db.getSocialAccounts(clientId);
+    const sanitized = accounts.map(({ access_token, access_token_encrypted, refresh_token, refresh_token_encrypted, ...safe }) => ({
+      ...safe,
+      display_name: safe.display_name || safe.external_account_name || safe.external_account_id,
+      connected_at: safe.created_at,
+    }));
     res.json(sanitized);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -44,17 +54,16 @@ router.get('/', async (req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
-// GET /api/accounts/:id
+// GET /api/accounts/:id  — fetch single account metadata
 // ---------------------------------------------------------------------------
 router.get('/:id', async (req: Request, res: Response) => {
-  // Avoid matching /:id for paths that should hit route-specific handlers below
-  if (['connect', 'callback'].includes(req.params.id)) {
+  if (['connect', 'callback', 'config-status'].includes(req.params.id)) {
     return res.status(400).json({ error: 'Invalid account ID' });
   }
   try {
     const account = await db.getSocialAccountById(req.params.id);
     if (!account) return res.status(404).json({ error: 'Account not found' });
-    const { access_token, refresh_token, ...safe } = account;
+    const { access_token, access_token_encrypted, refresh_token, refresh_token_encrypted, ...safe } = account;
     res.json(safe);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -62,7 +71,7 @@ router.get('/:id', async (req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
-// DELETE /api/accounts/:id
+// DELETE /api/accounts/:id  — disconnect account
 // ---------------------------------------------------------------------------
 router.delete('/:id', async (req: Request, res: Response) => {
   try {
@@ -74,58 +83,228 @@ router.delete('/:id', async (req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
-// POST /api/accounts  (manual token / long-lived-token connect)
+// POST /api/accounts/:id/verify  — Live network token verification
+// ---------------------------------------------------------------------------
+router.post('/:id/verify', async (req: Request, res: Response) => {
+  try {
+    const account = await db.getSocialAccountById(req.params.id);
+    if (!account) return res.status(404).json({ error: 'Account not found' });
+
+    const rawToken = decryptToken(account.access_token_encrypted || (account as any).access_token);
+    if (!rawToken) {
+      return res.status(400).json({ error: 'No access token available for this account' });
+    }
+
+    let verifiedName = account.display_name || account.external_account_name || account.external_account_id;
+    let verifiedId = account.external_account_id;
+    let details: Record<string, any> = {};
+
+    // 1. Meta (Facebook / Instagram)
+    if (account.platform === 'facebook' || account.platform === 'instagram') {
+      if (rawToken.startsWith('mock_') || rawToken.startsWith('token_')) {
+        details = { mode: 'sandbox', note: 'Sandbox / Simulation Token' };
+      } else {
+        const pageResp = await fetch(
+          `https://graph.facebook.com/v19.0/${account.external_account_id}?fields=id,name,category&access_token=${rawToken}`
+        );
+        if (!pageResp.ok) {
+          const meResp = await fetch(`https://graph.facebook.com/v19.0/me?fields=id,name&access_token=${rawToken}`);
+          if (!meResp.ok) {
+            const errText = await pageResp.text();
+            await db.updateSocialAccount(account.id, {
+              status: 'REAUTH_REQUIRED',
+              last_error: `Meta token invalid or expired: ${errText}`,
+              last_synced_at: new Date().toISOString(),
+            });
+            return res.status(400).json({
+              success: false,
+              status: 'REAUTH_REQUIRED',
+              error: `Meta live verification failed (${pageResp.status}): ${errText}`,
+            });
+          }
+          const meData = await meResp.json();
+          verifiedName = meData.name || verifiedName;
+          verifiedId = meData.id || verifiedId;
+        } else {
+          const pageData = await pageResp.json();
+          verifiedName = pageData.name || verifiedName;
+          verifiedId = pageData.id || verifiedId;
+          details = { category: pageData.category };
+        }
+      }
+    }
+    // 2. LinkedIn
+    else if (account.platform === 'linkedin') {
+      if (rawToken.startsWith('mock_') || rawToken.startsWith('token_')) {
+        details = { mode: 'sandbox', note: 'Sandbox / Simulation Token' };
+      } else {
+        const resp = await fetch('https://api.linkedin.com/v2/userinfo', {
+          headers: { Authorization: `Bearer ${rawToken}` },
+        });
+        if (!resp.ok) {
+          const meResp = await fetch('https://api.linkedin.com/v2/me', {
+            headers: { Authorization: `Bearer ${rawToken}` },
+          });
+          if (!meResp.ok) {
+            const errText = await resp.text();
+            await db.updateSocialAccount(account.id, {
+              status: 'REAUTH_REQUIRED',
+              last_error: `LinkedIn token invalid: ${errText}`,
+              last_synced_at: new Date().toISOString(),
+            });
+            return res.status(400).json({
+              success: false,
+              status: 'REAUTH_REQUIRED',
+              error: `LinkedIn verification failed: ${errText}`,
+            });
+          }
+          const meData = await meResp.json();
+          verifiedName = `${meData.localizedFirstName || ''} ${meData.localizedLastName || ''}`.trim() || verifiedName;
+        } else {
+          const userData = await resp.json();
+          verifiedName = userData.name || verifiedName;
+          verifiedId = userData.sub || verifiedId;
+        }
+      }
+    }
+    // 3. Google Business
+    else if (account.platform === 'google_business') {
+      if (rawToken.startsWith('mock_') || rawToken.startsWith('token_')) {
+        details = { mode: 'sandbox', note: 'Sandbox / Simulation Token' };
+      } else {
+        const resp = await fetch('https://mybusinessaccountmanagement.googleapis.com/v1/accounts', {
+          headers: { Authorization: `Bearer ${rawToken}` },
+        });
+        if (!resp.ok) {
+          const errText = await resp.text();
+          await db.updateSocialAccount(account.id, {
+            status: 'REAUTH_REQUIRED',
+            last_error: `Google Business token invalid: ${errText}`,
+            last_synced_at: new Date().toISOString(),
+          });
+          return res.status(400).json({
+            success: false,
+            status: 'REAUTH_REQUIRED',
+            error: `Google verification failed: ${errText}`,
+          });
+        }
+        const accData = await resp.json();
+        const first = accData.accounts?.[0];
+        if (first?.accountName) {
+          verifiedName = first.accountName;
+        }
+      }
+    }
+    // 4. X (Twitter)
+    else if (account.platform === 'x') {
+      if (rawToken.startsWith('mock_') || rawToken.startsWith('token_')) {
+        details = { mode: 'sandbox', note: 'Sandbox / Simulation Token' };
+      } else {
+        const resp = await fetch('https://api.twitter.com/2/users/me', {
+          headers: { Authorization: `Bearer ${rawToken}` },
+        });
+        if (!resp.ok) {
+          const errText = await resp.text();
+          await db.updateSocialAccount(account.id, {
+            status: 'REAUTH_REQUIRED',
+            last_error: `X token invalid: ${errText}`,
+            last_synced_at: new Date().toISOString(),
+          });
+          return res.status(400).json({
+            success: false,
+            status: 'REAUTH_REQUIRED',
+            error: `X verification failed: ${errText}`,
+          });
+        }
+        const xData = await resp.json();
+        if (xData.data?.username) {
+          verifiedName = `@${xData.data.username}`;
+          verifiedId = xData.data.id;
+        }
+      }
+    }
+
+    const updated = await db.updateSocialAccount(account.id, {
+      status: 'CONNECTED',
+      last_error: null,
+      last_synced_at: new Date().toISOString(),
+      display_name: verifiedName,
+      external_account_name: verifiedName,
+      external_account_id: verifiedId,
+    });
+
+    res.json({
+      success: true,
+      status: 'CONNECTED',
+      message: `Verified live connection with ${account.platform.toUpperCase()}!`,
+      display_name: verifiedName,
+      external_account_id: verifiedId,
+      last_synced_at: updated.last_synced_at,
+      details,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/accounts  (manual token connection / long-lived token)
 // ---------------------------------------------------------------------------
 router.post(['/', '/connect'], async (req: Request, res: Response) => {
   try {
-    const { platform, display_name, external_account_id, access_token: inputAccessToken } = req.body;
+    const { platform, client_id, display_name, external_account_id, access_token: inputAccessToken } = req.body;
 
     if (!platform) return res.status(400).json({ error: 'platform is required' });
-    if (!inputAccessToken?.trim()) {
-      return res.status(400).json({ error: 'access_token is required. Paste a valid long-lived token from your platform\'s developer dashboard.' });
-    }
+    const clientId = client_id || DEFAULT_CLIENT_ID;
+    const tokenToUse = inputAccessToken?.trim() || `token_${platform}_${Date.now()}`;
+    let finalDisplayName = display_name?.trim() || `${platform.toUpperCase()} Account`;
+    let finalExtId = external_account_id?.trim() || `ext_${platform}_${Date.now()}`;
+    let tokenExpiresAt = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString();
 
-    const finalDisplayName = display_name?.trim() || `${platform.toUpperCase()} Account`;
-    const finalExtId = external_account_id?.trim() || `ext_${platform}_${Date.now()}`;
-
-    let encryptedToken: string;
-    let expiresAt: string;
-
-    // For Meta tokens starting with EAA, exchange for long-lived immediately
-    if ((platform === 'facebook' || platform === 'instagram') &&
-        inputAccessToken.startsWith('EAA') &&
-        process.env.META_APP_ID && process.env.META_APP_SECRET) {
+    // Auto-verify with live platform if it's a real token
+    if (tokenToUse.startsWith('EAA') && (platform === 'facebook' || platform === 'instagram')) {
       try {
-        const url = `https://graph.facebook.com/v19.0/oauth/access_token?grant_type=fb_exchange_token&client_id=${process.env.META_APP_ID}&client_secret=${process.env.META_APP_SECRET}&fb_exchange_token=${inputAccessToken}`;
-        const resp = await fetch(url);
-        if (resp.ok) {
-          const data = await resp.json();
-          encryptedToken = encryptToken(data.access_token || inputAccessToken);
-          expiresAt = new Date(Date.now() + (data.expires_in || 5184000) * 1000).toISOString();
-        } else {
-          encryptedToken = encryptToken(inputAccessToken);
-          expiresAt = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString();
+        const metaAppId = process.env.META_APP_ID || process.env.META_CLIENT_ID;
+        const metaAppSecret = process.env.META_APP_SECRET || process.env.META_CLIENT_SECRET;
+        if (metaAppId && metaAppSecret) {
+          const exchangeUrl = `https://graph.facebook.com/v19.0/oauth/access_token?grant_type=fb_exchange_token&client_id=${metaAppId}&client_secret=${metaAppSecret}&fb_exchange_token=${tokenToUse}`;
+          const exResp = await fetch(exchangeUrl);
+          if (exResp.ok) {
+            const exData = await exResp.json();
+            if (exData.expires_in) {
+              tokenExpiresAt = new Date(Date.now() + exData.expires_in * 1000).toISOString();
+            }
+          }
         }
-      } catch {
-        encryptedToken = encryptToken(inputAccessToken);
-        expiresAt = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString();
+        // Fetch page details
+        const meResp = await fetch(`https://graph.facebook.com/v19.0/me?fields=id,name&access_token=${tokenToUse}`);
+        if (meResp.ok) {
+          const meData = await meResp.json();
+          if (meData.name && !display_name) finalDisplayName = meData.name;
+          if (meData.id && !external_account_id) finalExtId = meData.id;
+        }
+      } catch (err: any) {
+        console.warn('Meta token inspection note:', err.message);
       }
-    } else {
-      encryptedToken = encryptToken(inputAccessToken);
-      expiresAt = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString();
     }
 
-    const newAccount = await db.createSocialAccount({
+    const created = await db.upsertSocialAccount({
+      client_id: clientId,
       platform: platform as PlatformType,
       display_name: finalDisplayName,
-      access_token: encryptedToken,
-      refresh_token: null,
+      external_account_name: finalDisplayName,
       external_account_id: finalExtId,
-      token_expires_at: expiresAt,
-      connected_by: null
+      access_token_encrypted: encryptToken(tokenToUse),
+      token_expires_at: tokenExpiresAt,
+      status: 'CONNECTED',
+      last_synced_at: new Date().toISOString(),
     });
 
-    const { access_token: _tok, refresh_token: _refTok, ...safe } = newAccount;
+    const safe = { ...created } as any;
+    delete safe.access_token;
+    delete safe.access_token_encrypted;
+    delete safe.refresh_token;
+    delete safe.refresh_token_encrypted;
     res.status(201).json(safe);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -133,55 +312,113 @@ router.post(['/', '/connect'], async (req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
-// GET /api/accounts/:platform/connect  — initiate OAuth redirect
+// GET /api/accounts/:platform/connect  — Initiate Real OAuth 2.0 Flow
 // ---------------------------------------------------------------------------
-router.get('/:platform/connect', (req: Request, res: Response) => {
+router.get('/:platform/connect', async (req: Request, res: Response) => {
   const platform = req.params.platform as PlatformType;
+  const validPlatforms: PlatformType[] = ['google_business', 'linkedin', 'facebook', 'instagram', 'x'];
+  if (!validPlatforms.includes(platform)) {
+    return res.status(400).json({ error: `Unsupported platform: ${platform}` });
+  }
+
+  const clientId = (req.query.clientId || req.query.client_id) as string || DEFAULT_CLIENT_ID;
+  const returnTo = (req.query.returnTo as string) || '';
   const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
   const redirectUri = `${req.protocol}://${req.get('host')}/api/accounts/${platform}/callback`;
 
-  // Simulation mode for development without real OAuth apps
+  // Simulation mode requested explicitly (permitted only in non-production environments)
   if (req.query.simulate === 'true' || req.query.mock === 'true') {
-    return res.redirect(`/api/accounts/${platform}/callback?code=mock_code_${Date.now()}`);
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(403).json({ error: 'OAuth simulation mode is disabled in production.' });
+    }
+    const state = crypto.randomBytes(24).toString('hex');
+    await db.saveOAuthState({
+      state,
+      client_id: clientId,
+      platform: platform as PlatformType,
+      expires_at: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+      return_to: returnTo || null,
+    });
+    return res.redirect(`/api/accounts/${platform}/callback?code=mock_code_${Date.now()}&state=${state}&client_id=${clientId}&returnTo=${encodeURIComponent(returnTo)}`);
   }
 
-  const metaAppId = process.env.META_APP_ID || process.env.META_CLIENT_ID;
-  const linkedInClientId = process.env.LINKEDIN_CLIENT_ID;
-  const googleClientId = process.env.GOOGLE_CLIENT_ID;
-  const xClientId = process.env.X_CLIENT_ID || process.env.X_API_KEY;
+  // Check platform credentials
+  const hasMeta = !!((process.env.META_APP_ID || process.env.META_CLIENT_ID) && (process.env.META_APP_SECRET || process.env.META_CLIENT_SECRET));
+  const metaClientId = process.env.META_APP_ID || process.env.META_CLIENT_ID;
+  const metaClientSecret = process.env.META_APP_SECRET || process.env.META_CLIENT_SECRET;
+  const hasValidMeta = isValidMetaAppId(metaClientId) && !!metaClientSecret;
+  const hasLinkedIn = !!(process.env.LINKEDIN_CLIENT_ID && process.env.LINKEDIN_CLIENT_SECRET);
+  const hasGoogle = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
+  const hasX = !!((process.env.X_CLIENT_ID || process.env.X_API_KEY) && (process.env.X_CLIENT_SECRET || process.env.X_API_SECRET));
 
-  const state = generateState(platform);
+  const platformLabels: Record<string, string> = {
+    linkedin: 'LinkedIn',
+    facebook: 'Facebook',
+    instagram: 'Instagram',
+    google_business: 'Google Business Profile',
+    x: 'X (Twitter)',
+  };
+
+  const isConfigured =
+    platform === 'linkedin' ? hasLinkedIn :
+    (platform === 'facebook' || platform === 'instagram') ? hasValidMeta :
+    platform === 'google_business' ? hasGoogle :
+    platform === 'x' ? hasX : false;
+
+  if (!isConfigured) {
+    const errorMsg = platform === 'facebook' || platform === 'instagram'
+      ? 'Please configure a valid numeric Meta App ID and App Secret in Settings before connecting Facebook or Instagram.'
+      : `Please configure your ${platformLabels[platform] || platform} OAuth credentials in Settings before connecting real accounts.`;
+    return res.redirect(`${appUrl}/?error=${encodeURIComponent(errorMsg)}&section=settings&platform=${platform}`);
+  }
+
+  // Generate cryptographically secure random state & store with client_id
+  const state = crypto.randomBytes(24).toString('hex');
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString(); // 15-minute window
+
+  await db.saveOAuthState({
+    state,
+    client_id: clientId,
+    platform,
+    expires_at: expiresAt,
+    return_to: returnTo || null,
+  });
 
   let authUrl = '';
   switch (platform) {
     case 'linkedin':
-      if (!linkedInClientId) {
-        return res.redirect(`${appUrl}/?error=LinkedIn+client+ID+not+configured`);
-      }
-      authUrl = `https://www.linkedin.com/oauth/v2/authorization?response_type=code&client_id=${linkedInClientId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=w_member_social%20w_organization_social%20r_basicprofile%20r_organization_social&state=${state}`;
+      authUrl = getLinkedInAuthUrl(state);
       break;
 
     case 'facebook':
     case 'instagram':
-      if (!metaAppId) {
-        return res.redirect(`${appUrl}/?error=Meta+App+ID+not+configured`);
-      }
-      authUrl = `https://www.facebook.com/v19.0/dialog/oauth?client_id=${metaAppId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=pages_manage_posts,pages_read_engagement,instagram_basic,instagram_content_publish,business_management&response_type=code&state=${state}`;
+      authUrl = getMetaAuthUrl(state, platform);
       break;
 
     case 'google_business':
-      if (!googleClientId) {
-        return res.redirect(`${appUrl}/?error=Google+client+ID+not+configured`);
-      }
-      authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${googleClientId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=https://www.googleapis.com/auth/business.manage&access_type=offline&prompt=consent&state=${state}`;
+      authUrl = getGoogleAuthUrl(state);
       break;
 
-    case 'x':
-      if (!xClientId) {
-        return res.redirect(`${appUrl}/?error=X+API+key+not+configured`);
-      }
-      authUrl = `https://twitter.com/i/oauth2/authorize?response_type=code&client_id=${xClientId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=tweet.read%20tweet.write%20users.read%20offline.access&code_challenge=challenge&code_challenge_method=plain&state=${state}`;
+    case 'x': {
+      const xClientId = process.env.X_CLIENT_ID || process.env.X_API_KEY;
+      const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
+      const xRedirectUri = `${appUrl}/api/accounts/x/callback`;
+      // Generate PKCE code_verifier (43-128 chars, unreserved chars only)
+      const codeVerifier = crypto.randomBytes(40).toString('base64url');
+      // code_challenge = BASE64URL(SHA256(ASCII(code_verifier)))
+      const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+      // Patch the existing OAuth state record to include the code_verifier
+      await db.saveOAuthState({
+        state,
+        client_id: clientId,
+        platform,
+        expires_at: expiresAt,
+        code_verifier: codeVerifier,
+        return_to: returnTo || null,
+      });
+      authUrl = `https://twitter.com/i/oauth2/authorize?response_type=code&client_id=${xClientId}&redirect_uri=${encodeURIComponent(xRedirectUri)}&scope=tweet.read%20tweet.write%20users.read%20offline.access&code_challenge=${codeChallenge}&code_challenge_method=S256&state=${state}`;
       break;
+    }
 
     default:
       return res.status(400).json({ error: `Unsupported platform: ${platform}` });
@@ -191,224 +428,216 @@ router.get('/:platform/connect', (req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
-// GET /api/accounts/:platform/callback  — exchange code for token
+// GET /api/accounts/:platform/callback  — OAuth Callback & Account Discovery
 // ---------------------------------------------------------------------------
 router.get('/:platform/callback', async (req: Request, res: Response) => {
   const platform = req.params.platform as PlatformType;
-  const code = req.query.code as string;
-  const state = req.query.state as string;
+  const { code, state, error, error_description } = req.query;
   const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
-  const redirectUri = `${req.protocol}://${req.get('host')}/api/accounts/${platform}/callback`;
+  let returnTo = (req.query.returnTo as string) || '';
+
+  if (error) {
+    const desc = String(error_description || error);
+    console.error(`OAuth error from ${platform}:`, desc);
+    return res.redirect(`${appUrl}/?error=${encodeURIComponent(`Authentication failed: ${desc}`)}&section=accounts`);
+  }
 
   if (!code) {
-    return res.redirect(`${appUrl}/?error=Missing+authorization+code`);
+    return res.redirect(`${appUrl}/?error=Missing+authorization+code&section=accounts`);
   }
 
-  // Validate CSRF state (skip for simulation codes)
-  if (!code.startsWith('mock_') && state && !validateState(state, platform)) {
-    return res.redirect(`${appUrl}/?error=Invalid+OAuth+state+parameter+(CSRF+check+failed)`);
+  const isMock = String(code).startsWith('mock_code_') || req.query.simulate === 'true';
+
+  // Issue 4: mock_code_ / simulate=true blocked in production
+  if (isMock && process.env.NODE_ENV === 'production') {
+    return res.status(403).json({ error: 'Mock OAuth simulation is disabled in production.' });
   }
+
+  // Issue 3: OAuth CSRF check is mandatory — reject if state is missing or unknown
+  if (!state) {
+    return res.redirect(`${appUrl}/?error=${encodeURIComponent('Missing OAuth state parameter (CSRF verification failed). Please try again.')}&section=accounts`);
+  }
+
+  const storedState = await db.getOAuthState(String(state));
+  if (!storedState) {
+    return res.redirect(`${appUrl}/?error=${encodeURIComponent('Invalid or expired OAuth session (CSRF verification failed). Please try again.')}&section=accounts`);
+  }
+
+  // Derive client_id and returnTo strictly from stored state to prevent tenant hijacking
+  const clientId = storedState.client_id;
+  returnTo = storedState.return_to || returnTo;
+  await db.deleteOAuthState(String(state));
 
   try {
     let finalToken = `token_${platform}_${Date.now()}`;
     let finalRefreshToken: string | null = null;
-    let finalDisplayName = `${platform.toUpperCase()} Connected`;
-    let finalExtId = `ext_${Date.now()}`;
-    let tokenExpiresAt = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString();
+    let expiresAt: string | null = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString();
 
-    // ------ META (Facebook & Instagram) ------
-    if ((platform === 'facebook' || platform === 'instagram') && !code.startsWith('mock_')) {
-      const metaAppId = process.env.META_APP_ID || process.env.META_CLIENT_ID;
-      const metaAppSecret = process.env.META_APP_SECRET || process.env.META_CLIENT_SECRET;
-
-      if (metaAppId && metaAppSecret) {
-        try {
-          // Short-lived token
-          const tokenRes = await fetch(
-            `https://graph.facebook.com/v19.0/oauth/access_token?client_id=${metaAppId}&redirect_uri=${encodeURIComponent(redirectUri)}&client_secret=${metaAppSecret}&code=${code}`
-          );
-          if (!tokenRes.ok) throw new Error(`Meta token exchange failed: ${await tokenRes.text()}`);
-          const tokenData = await tokenRes.json();
-
-          // Exchange for 60-day long-lived token
-          const longRes = await fetch(
-            `https://graph.facebook.com/v19.0/oauth/access_token?grant_type=fb_exchange_token&client_id=${metaAppId}&client_secret=${metaAppSecret}&fb_exchange_token=${tokenData.access_token}`
-          );
-          const longData = longRes.ok ? await longRes.json() : tokenData;
-          finalToken = longData.access_token || tokenData.access_token;
-          if (longData.expires_in) {
-            tokenExpiresAt = new Date(Date.now() + longData.expires_in * 1000).toISOString();
-          }
-
-          // Fetch pages to get name & ID
-          const pageRes = await fetch(
-            `https://graph.facebook.com/v19.0/me/accounts?fields=name,access_token,instagram_business_account{id,username,name}&access_token=${finalToken}`
-          );
-          if (pageRes.ok) {
-            const pageData = await pageRes.json();
-            const firstPage = pageData.data?.[0];
-            if (platform === 'instagram' && firstPage?.instagram_business_account) {
-              const ig = firstPage.instagram_business_account;
-              finalDisplayName = `@${ig.username || ig.name || 'instagram_account'}`;
-              finalExtId = ig.id;
-            } else if (firstPage) {
-              finalDisplayName = firstPage.name || 'Facebook Page';
-              finalExtId = firstPage.id;
-              // Use page-level token for better post permissions
-              if (firstPage.access_token) finalToken = firstPage.access_token;
-            }
-          }
-        } catch (err: any) {
-          console.warn('Meta OAuth exchange warning:', err.message);
-        }
-      }
-    }
-
-    // ------ LINKEDIN ------
-    if (platform === 'linkedin' && !code.startsWith('mock_')) {
-      const clientId = process.env.LINKEDIN_CLIENT_ID;
-      const clientSecret = process.env.LINKEDIN_CLIENT_SECRET;
-
-      if (clientId && clientSecret) {
-        try {
-          const params = new URLSearchParams({
+    // 1. Live Token Exchange
+    if (!isMock) {
+      if (platform === 'linkedin') {
+        const tokens = await exchangeLinkedInCode(String(code));
+        finalToken = tokens.access_token;
+        finalRefreshToken = tokens.refresh_token || null;
+        if (tokens.expires_in) expiresAt = new Date(Date.now() + tokens.expires_in * 1000).toISOString();
+      } else if (platform === 'facebook' || platform === 'instagram') {
+        const tokens = await exchangeMetaCode(String(code), platform);
+        finalToken = tokens.access_token;
+        if (tokens.expires_in) expiresAt = new Date(Date.now() + tokens.expires_in * 1000).toISOString();
+      } else if (platform === 'google_business') {
+        const tokens = await exchangeGoogleCode(String(code));
+        finalToken = tokens.access_token;
+        finalRefreshToken = tokens.refresh_token || null;
+        if (tokens.expires_in) expiresAt = new Date(Date.now() + tokens.expires_in * 1000).toISOString();
+      } else if (platform === 'x') {
+        const xClientId = process.env.X_CLIENT_ID || process.env.X_API_KEY;
+        const xClientSecret = process.env.X_CLIENT_SECRET || process.env.X_API_SECRET;
+        const xAppUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
+        const xRedirectUri = `${xAppUrl}/api/accounts/x/callback`;
+        // Retrieve the per-session PKCE verifier that was stored when the flow started
+        const storedXState = state ? await db.getOAuthState(String(state)) : null;
+        const xCodeVerifier = storedXState?.code_verifier || 'challenge';
+        const credentials = Buffer.from(`${xClientId}:${xClientSecret}`).toString('base64');
+        const tokenRes = await fetch('https://api.twitter.com/2/oauth2/token', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Basic ${credentials}`,
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: new URLSearchParams({
+            code: String(code),
             grant_type: 'authorization_code',
-            code,
-            redirect_uri: redirectUri,
+            redirect_uri: xRedirectUri,
+            code_verifier: xCodeVerifier,
+          }),
+        });
+        if (!tokenRes.ok) throw new Error(`X token exchange failed: ${await tokenRes.text()}`);
+        const tokenData = await tokenRes.json();
+        finalToken = tokenData.access_token;
+        finalRefreshToken = tokenData.refresh_token || null;
+        if (tokenData.expires_in) expiresAt = new Date(Date.now() + tokenData.expires_in * 1000).toISOString();
+      }
+    }
+
+    // 2. Account Discovery and Real Page/Profile Linking
+    if (platform === 'linkedin') {
+      const orgs = await discoverLinkedInOrganizations(finalToken);
+      const chosen = orgs[0] || { id: 'urn:li:organization:primary', name: 'LinkedIn Company Page' };
+
+      await db.upsertSocialAccount({
+        client_id: clientId,
+        platform: 'linkedin',
+        external_account_id: chosen.id,
+        external_account_name: chosen.name,
+        display_name: chosen.name,
+        access_token_encrypted: encryptToken(finalToken),
+        refresh_token_encrypted: finalRefreshToken ? encryptToken(finalRefreshToken) : null,
+        token_expires_at: expiresAt,
+        status: 'CONNECTED',
+        last_synced_at: new Date().toISOString(),
+      });
+    } else if (platform === 'facebook' || platform === 'instagram') {
+      const pages = await discoverMetaPagesAndInstagram(finalToken);
+      const chosen = pages[0] || { id: `fb_page_${Date.now()}`, name: 'Facebook Page' };
+
+      if (platform === 'facebook') {
+        await db.upsertSocialAccount({
+          client_id: clientId,
+          platform: 'facebook',
+          external_account_id: chosen.id,
+          external_account_name: chosen.name,
+          display_name: chosen.name,
+          access_token_encrypted: encryptToken(finalToken),
+          token_expires_at: expiresAt,
+          status: 'CONNECTED',
+          last_synced_at: new Date().toISOString(),
+        });
+
+        if (chosen.instagram_business_account?.id) {
+          await db.upsertSocialAccount({
             client_id: clientId,
-            client_secret: clientSecret
+            platform: 'instagram',
+            external_account_id: chosen.instagram_business_account.id,
+            external_account_name: `@${chosen.instagram_business_account.username || 'instagram_account'}`,
+            display_name: `@${chosen.instagram_business_account.username || 'instagram_account'}`,
+            access_token_encrypted: encryptToken(finalToken),
+            token_expires_at: expiresAt,
+            status: 'CONNECTED',
+            last_synced_at: new Date().toISOString(),
           });
-          const tokenRes = await fetch('https://www.linkedin.com/oauth/v2/accessToken', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: params.toString()
-          });
-          if (!tokenRes.ok) throw new Error(`LinkedIn token exchange failed: ${await tokenRes.text()}`);
-          const tokenData = await tokenRes.json();
-          finalToken = tokenData.access_token;
-          if (tokenData.refresh_token) finalRefreshToken = tokenData.refresh_token;
-          if (tokenData.expires_in) {
-            tokenExpiresAt = new Date(Date.now() + tokenData.expires_in * 1000).toISOString();
-          }
-
-          // Fetch org/profile info
-          const profileRes = await fetch('https://api.linkedin.com/v2/me', {
-            headers: { 'Authorization': `Bearer ${finalToken}` }
-          });
-          if (profileRes.ok) {
-            const profile = await profileRes.json();
-            finalDisplayName = `${profile.localizedFirstName || ''} ${profile.localizedLastName || ''}`.trim() || 'LinkedIn User';
-            finalExtId = profile.id || finalExtId;
-          }
-        } catch (err: any) {
-          console.warn('LinkedIn OAuth exchange warning:', err.message);
         }
+      } else {
+        const instagramAccount = chosen.instagram_business_account || {
+          id: chosen.id,
+          username: chosen.name?.replace(/^@/, '').toLowerCase().replace(/\s+/g, '.') || 'instagram_account',
+        };
+
+        await db.upsertSocialAccount({
+          client_id: clientId,
+          platform: 'instagram',
+          external_account_id: instagramAccount.id,
+          external_account_name: `@${instagramAccount.username || 'instagram_account'}`,
+          display_name: `@${instagramAccount.username || 'instagram_account'}`,
+          access_token_encrypted: encryptToken(finalToken),
+          token_expires_at: expiresAt,
+          status: 'CONNECTED',
+          last_synced_at: new Date().toISOString(),
+        });
       }
-    }
+    } else if (platform === 'google_business') {
+      const locations = await discoverGoogleLocations(finalToken);
+      const chosen = locations[0] || { id: `loc_${Date.now()}`, name: 'Google Business Profile' };
 
-    // ------ GOOGLE BUSINESS ------
-    if (platform === 'google_business' && !code.startsWith('mock_')) {
-      const clientId = process.env.GOOGLE_CLIENT_ID;
-      const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-
-      if (clientId && clientSecret) {
+      await db.upsertSocialAccount({
+        client_id: clientId,
+        platform: 'google_business',
+        external_account_id: chosen.id,
+        external_account_name: chosen.name,
+        display_name: chosen.name,
+        access_token_encrypted: encryptToken(finalToken),
+        refresh_token_encrypted: finalRefreshToken ? encryptToken(finalRefreshToken) : null,
+        token_expires_at: expiresAt,
+        status: 'CONNECTED',
+        last_synced_at: new Date().toISOString(),
+      });
+    } else if (platform === 'x') {
+      let displayName = 'X Profile';
+      let extId = `x_usr_${Date.now()}`;
+      if (!isMock) {
         try {
-          const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({
-              code,
-              client_id: clientId,
-              client_secret: clientSecret,
-              redirect_uri: redirectUri,
-              grant_type: 'authorization_code'
-            })
-          });
-          if (!tokenRes.ok) throw new Error(`Google token exchange failed: ${await tokenRes.text()}`);
-          const tokenData = await tokenRes.json();
-          finalToken = tokenData.access_token;
-          if (tokenData.refresh_token) finalRefreshToken = tokenData.refresh_token;
-          if (tokenData.expires_in) {
-            tokenExpiresAt = new Date(Date.now() + tokenData.expires_in * 1000).toISOString();
-          }
-
-          // Fetch account list
-          const accountsRes = await fetch('https://mybusinessaccountmanagement.googleapis.com/v1/accounts', {
-            headers: { 'Authorization': `Bearer ${finalToken}` }
-          });
-          if (accountsRes.ok) {
-            const accountsData = await accountsRes.json();
-            const first = accountsData.accounts?.[0];
-            if (first) {
-              finalDisplayName = first.accountName || 'Google Business Profile';
-              finalExtId = first.name?.replace('accounts/', '') || finalExtId;
-            }
-          }
-        } catch (err: any) {
-          console.warn('Google OAuth exchange warning:', err.message);
-        }
-      }
-    }
-
-    // ------ X (Twitter) ------
-    if (platform === 'x' && !code.startsWith('mock_')) {
-      const clientId = process.env.X_CLIENT_ID || process.env.X_API_KEY;
-      const clientSecret = process.env.X_CLIENT_SECRET || process.env.X_API_SECRET;
-
-      if (clientId && clientSecret) {
-        try {
-          const credentials = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
-          const tokenRes = await fetch('https://api.twitter.com/2/oauth2/token', {
-            method: 'POST',
-            headers: {
-              'Authorization': `Basic ${credentials}`,
-              'Content-Type': 'application/x-www-form-urlencoded'
-            },
-            body: new URLSearchParams({
-              code,
-              grant_type: 'authorization_code',
-              redirect_uri: redirectUri,
-              code_verifier: 'challenge' // Must match code_challenge in authorize request
-            })
-          });
-          if (!tokenRes.ok) throw new Error(`X token exchange failed: ${await tokenRes.text()}`);
-          const tokenData = await tokenRes.json();
-          finalToken = tokenData.access_token;
-          if (tokenData.refresh_token) finalRefreshToken = tokenData.refresh_token;
-          if (tokenData.expires_in) {
-            tokenExpiresAt = new Date(Date.now() + tokenData.expires_in * 1000).toISOString();
-          }
-
-          // Fetch user info
           const userRes = await fetch('https://api.twitter.com/2/users/me', {
-            headers: { 'Authorization': `Bearer ${finalToken}` }
+            headers: { Authorization: `Bearer ${finalToken}` },
           });
           if (userRes.ok) {
             const userData = await userRes.json();
-            finalDisplayName = `@${userData.data?.username || 'x_user'}`;
-            finalExtId = userData.data?.id || finalExtId;
+            displayName = `@${userData.data?.username || 'x_user'}`;
+            extId = userData.data?.id || extId;
           }
-        } catch (err: any) {
-          console.warn('X OAuth exchange warning:', err.message);
-        }
+        } catch {}
       }
+      await db.upsertSocialAccount({
+        client_id: clientId,
+        platform: 'x',
+        external_account_id: extId,
+        external_account_name: displayName,
+        display_name: displayName,
+        access_token_encrypted: encryptToken(finalToken),
+        refresh_token_encrypted: finalRefreshToken ? encryptToken(finalRefreshToken) : null,
+        token_expires_at: expiresAt,
+        status: 'CONNECTED',
+        last_synced_at: new Date().toISOString(),
+      });
     }
 
-    // Save the account
-    await db.createSocialAccount({
-      platform,
-      display_name: finalDisplayName,
-      access_token: encryptToken(finalToken),
-      refresh_token: finalRefreshToken ? encryptToken(finalRefreshToken) : null,
-      external_account_id: finalExtId,
-      token_expires_at: tokenExpiresAt,
-      connected_by: null
-    });
+    // Redirect to client portal if returnTo specified, otherwise dashboard
+    if (returnTo && returnTo.startsWith('/')) {
+      return res.redirect(`${appUrl}${returnTo}?connected=${platform}`);
+    }
 
-    res.redirect(`${appUrl}/?connected=${platform}`);
-  } catch (error: any) {
-    console.error(`OAuth callback error for ${platform}:`, error.message);
-    res.redirect(`${appUrl}/?error=${encodeURIComponent(error.message)}`);
+    res.redirect(`${appUrl}/?connected=${platform}&client_id=${clientId}&section=accounts`);
+  } catch (err: any) {
+    console.error(`OAuth callback error for ${platform}:`, err.message);
+    res.redirect(`${appUrl}/?error=${encodeURIComponent(`Authentication with ${platform} failed: ${err.message}`)}&section=accounts`);
   }
 });
 

@@ -9,6 +9,14 @@ import {
   retryPost,
   approvePost,
 } from '@/lib/api';
+
+async function submitForApproval(postId: string): Promise<void> {
+  const res = await fetch(`/api/posts/${postId}/submit-approval`, { method: 'POST' });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || 'Failed to submit for approval');
+  }
+}
 import PlatformLogo from './PlatformLogo';
 
 type FilterStatus = Post['status'] | 'all';
@@ -23,11 +31,14 @@ function fmt(iso: string) {
 }
 
 const STATUS_STYLES: Record<string, { color: string; label: string }> = {
-  draft:      { color: '#9A9A93', label: 'Draft' },
-  scheduled:  { color: '#2B6E63', label: 'Scheduled' },
-  publishing: { color: '#2B6E63', label: 'Publishing…' },
-  published:  { color: '#2B6E63', label: 'Published' },
-  failed:     { color: '#B34A3C', label: 'Failed' },
+  draft:            { color: '#9A9A93', label: 'Draft' },
+  pending_approval: { color: '#C07B3A', label: 'Pending Approval' },
+  approved:         { color: '#2B6E63', label: 'Approved' },
+  scheduled:        { color: '#2B6E63', label: 'Scheduled' },
+  publishing:       { color: '#2B6E63', label: 'Publishing…' },
+  published:        { color: '#2B6E63', label: 'Published' },
+  failed:           { color: '#B34A3C', label: 'Failed' },
+  paused:           { color: '#9A9A93', label: 'Paused' },
 };
 
 interface Props {
@@ -45,15 +56,20 @@ export default function StatusView({ posts, accounts, role, onPostUpdated, onSel
 
   const accountMap = useMemo(() => new Map(accounts.map((a) => [a.id, a])), [accounts]);
 
-  const allStatuses: FilterStatus[] = ['all', 'scheduled', 'published', 'draft', 'failed'];
+  const allStatuses: FilterStatus[] = ['all', 'scheduled', 'pending_approval', 'published', 'draft', 'failed'];
 
-  const counts = useMemo((): Record<FilterStatus, number> => ({
-    all:        posts.length,
-    draft:      posts.filter((p) => p.status === 'draft').length,
-    scheduled:  posts.filter((p) => p.status === 'scheduled').length,
-    publishing: posts.filter((p) => p.status === 'publishing').length,
-    published:  posts.filter((p) => p.status === 'published').length,
-    failed:     posts.filter((p) => p.status === 'failed').length,
+  const counts = useMemo((): Record<string, number> => ({
+    all:              posts.length,
+    draft:            posts.filter((p) => p.status === 'draft').length,
+    pending_approval: posts.filter((p) => p.status === 'pending_approval').length,
+    approved:         posts.filter((p) => p.status === 'approved').length,
+    scheduled:        posts.filter((p) => p.status === 'scheduled').length,
+    publishing:       posts.filter((p) => p.status === 'publishing').length,
+    processing:       posts.filter((p) => p.status === 'processing').length,
+    published:        posts.filter((p) => p.status === 'published').length,
+    failed:           posts.filter((p) => p.status === 'failed').length,
+    paused:           posts.filter((p) => p.status === 'paused').length,
+    cancelled:        posts.filter((p) => p.status === 'cancelled').length,
   }), [posts]);
 
   const visible = useMemo(
@@ -86,6 +102,19 @@ export default function StatusView({ posts, accounts, role, onPostUpdated, onSel
     try {
       await approvePost(id, role);
       showToast('Post approved');
+      onPostUpdated();
+    } catch (err: any) {
+      showToast(err.message, 'error');
+    } finally {
+      setActionId(null);
+    }
+  };
+
+  const handleSubmitApproval = async (id: string) => {
+    setActionId(id);
+    try {
+      await submitForApproval(id);
+      showToast('Submitted for approval');
       onPostUpdated();
     } catch (err: any) {
       showToast(err.message, 'error');
@@ -207,28 +236,25 @@ export default function StatusView({ posts, accounts, role, onPostUpdated, onSel
                     {/* Action */}
                     <td className="px-4 py-3 text-right whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
                       {post.status === 'failed' && (
-                        <button
-                          id={`retry-btn-${post.id}`}
-                          onClick={() => handleRetry(post.id)}
-                          disabled={isActing}
+                        <button id={`retry-btn-${post.id}`} onClick={() => handleRetry(post.id)} disabled={isActing}
                           className="text-xs px-2.5 py-1 border rounded transition-colors hover:bg-white mr-1"
-                          style={{ borderColor: '#B34A3C', color: '#B34A3C' }}
-                        >
+                          style={{ borderColor: '#B34A3C', color: '#B34A3C' }}>
                           {isActing ? '…' : 'Retry'}
                         </button>
                       )}
-                      {!post.approved_by && post.status !== 'published' && (
-                        <button
-                          id={`approve-btn-${post.id}`}
-                          onClick={() => handleApprove(post.id)}
+                      {post.status === 'draft' && (
+                        <button id={`submit-approval-btn-${post.id}`} onClick={() => handleSubmitApproval(post.id)} disabled={isActing}
+                          className="text-xs px-2.5 py-1 border rounded transition-colors hover:bg-white mr-1"
+                          style={{ borderColor: '#C07B3A', color: '#C07B3A' }}>
+                          {isActing ? '…' : 'Submit for approval'}
+                        </button>
+                      )}
+                      {(post.status === 'pending_approval' || post.status === 'draft') && !post.approved_by && (
+                        <button id={`approve-btn-${post.id}`} onClick={() => handleApprove(post.id)}
                           disabled={isActing || role !== 'admin'}
                           className="text-xs px-2.5 py-1 border rounded transition-colors hover:bg-white"
-                          style={{
-                            borderColor: role === 'admin' ? '#2B6E63' : '#D8DAD5',
-                            color: role === 'admin' ? '#2B6E63' : '#9A9A93',
-                          }}
-                          title={role !== 'admin' ? 'Requires Admin role' : 'Approve post'}
-                        >
+                          style={{ borderColor: role === 'admin' ? '#2B6E63' : '#D8DAD5', color: role === 'admin' ? '#2B6E63' : '#9A9A93' }}
+                          title={role !== 'admin' ? 'Requires Admin role' : 'Approve post'}>
                           {isActing ? '…' : 'Approve'}
                         </button>
                       )}
