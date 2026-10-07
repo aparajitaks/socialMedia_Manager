@@ -4,6 +4,8 @@ const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:5001";
 const BACKEND_PUBLIC_URL = process.env.BACKEND_PUBLIC_URL || BACKEND_URL;
 
 const nextConfig: NextConfig = {
+  // @ts-ignore - Next.js 16 agentRules config
+  agentRules: false,
   images: { unoptimized: true },
 
   async rewrites() {
