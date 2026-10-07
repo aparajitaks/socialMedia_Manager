@@ -345,7 +345,7 @@ export const mockDb = {
     FAILED: ['RETRYING', 'SCHEDULED', 'PROCESSING'],
     PUBLISHED: [],
     COMPLETED: [],
-    CANCELLED: [],
+    CANCELLED: ['SCHEDULED'],
   },
   createPublishJobsTransaction: vi.fn((jobsData: any[]) => {
     const existingKeys = new Set((seed.publish_jobs || []).map((j) => j.idempotency_key));

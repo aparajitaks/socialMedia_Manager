@@ -54,10 +54,10 @@ if (supabase) {
 // ---------------------------------------------------------------------------
 // Local JSON Store (fallback / zero-config mode)
 // ---------------------------------------------------------------------------
-const DATA_DIR = fs.existsSync(path.join(process.cwd(), 'data'))
-  ? path.join(process.cwd(), 'data')
-  : fs.existsSync(path.join(process.cwd(), 'backend', 'data'))
+const DATA_DIR = fs.existsSync(path.join(process.cwd(), 'backend', 'data'))
   ? path.join(process.cwd(), 'backend', 'data')
+  : fs.existsSync(path.join(process.cwd(), 'data'))
+  ? path.join(process.cwd(), 'data')
   : fs.existsSync(path.join(process.cwd(), '..', 'data'))
   ? path.join(process.cwd(), '..', 'data')
   : path.join(process.cwd(), 'data');
@@ -344,17 +344,13 @@ function getInitialData(): LocalDB {
   };
 }
 
-let inMemoryDB: LocalDB | null = null;
-
 function readLocalDB(): LocalDB {
-  if (inMemoryDB) return inMemoryDB;
-
   try {
     if (fs.existsSync(DB_FILE)) {
       const raw = fs.readFileSync(DB_FILE, 'utf-8');
       const parsed = JSON.parse(raw);
       const initial = getInitialData();
-      inMemoryDB = {
+      return {
         ...initial,
         ...parsed,
         workspace_members: parsed.workspace_members || initial.workspace_members,
@@ -371,31 +367,26 @@ function readLocalDB(): LocalDB {
         inbox_messages: parsed.inbox_messages || [],
         client_members: parsed.client_members || [],
         audit_logs: parsed.audit_logs || [],
+        social_accounts: (parsed.social_accounts && parsed.social_accounts.length > 0) ? parsed.social_accounts : initial.social_accounts,
       };
-
-      if (!inMemoryDB!.social_accounts || inMemoryDB!.social_accounts.length === 0) {
-        inMemoryDB!.social_accounts = initial.social_accounts;
-      }
-      return inMemoryDB!;
     }
   } catch (err) {
-    console.error('Failed to read local DB, resetting to defaults:', err);
+    console.error('Failed to read local DB, initializing defaults:', err);
   }
 
-  inMemoryDB = getInitialData();
+  const initial = getInitialData();
   try {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(DB_FILE, JSON.stringify(inMemoryDB, null, 2), 'utf-8');
+    fs.writeFileSync(DB_FILE, JSON.stringify(initial, null, 2), 'utf-8');
   } catch (_) {}
 
-  return inMemoryDB;
+  return initial;
 }
 
 async function writeLocalDB(data: LocalDB): Promise<void> {
-  inMemoryDB = data;
   try {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    await fs.promises.writeFile(DB_FILE, JSON.stringify(data, null, 2), 'utf-8');
+    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), 'utf-8');
   } catch (_) {}
 }
 
@@ -1303,7 +1294,7 @@ export const db = {
     FAILED: ['RETRYING', 'SCHEDULED', 'PROCESSING'], // manual retry
     PUBLISHED: [],
     COMPLETED: [],
-    CANCELLED: [],
+    CANCELLED: ['SCHEDULED'],
   } as Record<string, string[]>,
 
   // Publishing Queue (PublishJob & PublishAttempt)
@@ -1321,8 +1312,8 @@ export const db = {
       idempotency_key: data.idempotency_key || `job_${data.post_id}_${data.variant_id || data.social_account_id}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       attempt_count: data.attempt_count || 0,
       max_attempts: data.max_attempts || 3,
-      locked_at: null,
-      locked_by: null,
+      locked_at: data.locked_at || null,
+      locked_by: data.locked_by || null,
       started_at: null,
       completed_at: null,
       next_retry_at: null,
@@ -1706,6 +1697,18 @@ export const db = {
     current.publish_attempts.push(attempt);
     await writeLocalDB(current);
     return attempt;
+  },
+
+  async getPublishAttempts(jobId?: string): Promise<PublishAttempt[]> {
+    if (supabase) {
+      let q = supabase.from('publish_attempts').select('*').order('executed_at', { ascending: false });
+      if (jobId) q = q.eq('job_id', jobId);
+      const { data, error } = await q;
+      if (error) sbError('getPublishAttempts', error);
+      return data || [];
+    }
+    const attempts = readLocalDB().publish_attempts || [];
+    return jobId ? attempts.filter((a) => a.job_id === jobId) : attempts;
   },
 
   // Content Libraries (RecurPost-style Evergreen Content)
